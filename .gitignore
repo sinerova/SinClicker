@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target/
+
+# Windows build artifacts
+.vs/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Environment files and secrets
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Editor and tooling
+.idea/
+.vscode/
+*.swp
+*~
+
+# Temporary files
+*.tmp
+*.bak
+*.log

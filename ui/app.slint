@@ -1,0 +1,91 @@
+import { Button, ComboBox, HorizontalBox, SpinBox, VerticalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "SinClicker";
+    preferred-width: 360px;
+    preferred-height: 310px;
+
+    in property <bool> running: false;
+    in property <string> input-error: "";
+    // Populated from the Rust catalog (`settings::SUPPORTED_HOTKEYS`) before
+    // the event loop starts, so the ComboBox order and the Rust index
+    // mapping can never drift apart.
+    in property <[string]> hotkey-model;
+    in-out property <int> hotkey-index: 0;
+    in-out property <int> cps: 10;
+
+    callback toggle-clicking();
+    callback cps-changed(value: int);
+    callback hotkey-changed(display: string);
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            text: "SinClicker";
+            font-size: 20px;
+            font-weight: FontWeight.semi-bold;
+        }
+
+        Text {
+            text: "Auto left-clicks at the current pointer position.";
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: running ? "Clicking" : "Stopped";
+            font-size: 14px;
+            font-weight: FontWeight.semi-bold;
+        }
+
+        Text {
+            visible: input-error != "";
+            text: input-error;
+            wrap: word-wrap;
+            font-size: 12px;
+        }
+
+        Button {
+            text: running ? "Stop" : "Start";
+            height: 36px;
+            clicked => {
+                toggle-clicking();
+            }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            Text {
+                text: "Clicks per second";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                horizontal-stretch: 1;
+                minimum: 1;
+                maximum: 100;
+                step-size: 1;
+                value <=> cps;
+                edited(value) => {
+                    cps-changed(value);
+                }
+            }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            Text {
+                text: "Toggle hotkey";
+                vertical-alignment: center;
+            }
+            ComboBox {
+                horizontal-stretch: 1;
+                model: hotkey-model;
+                current-index <=> hotkey-index;
+                selected(display) => {
+                    hotkey-changed(display);
+                }
+            }
+        }
+    }
+}
