@@ -5,7 +5,7 @@
 use slint::SharedString;
 use slint::Weak;
 
-use sinclicker::clicker::{Worker, WorkerEvent, DEFAULT_CPS};
+use sinclicker::clicker::{validate_cps, Worker, WorkerEvent};
 use sinclicker::hotkey::{Hotkey, HotkeyEvent};
 use sinclicker::settings::{self, DEFAULT_HOTKEY_DISPLAY};
 
@@ -22,11 +22,20 @@ fn main() -> Result<(), slint::PlatformError> {
                 .expect("the default hotkey must be supported")
         });
 
+    // Resolve the CPS to start with: the persisted value when it is in range,
+    // otherwise the default. The same value initializes the UI (below) and the
+    // worker (further below), so the two can never drift apart at startup.
+    let initial_cps = settings::resolve_startup_cps(settings::load_cps());
+
     let window = MainWindow::new()?;
     let weak = window.as_weak();
     if let Some(index) = ui_index_for_display(initial.display) {
         window.set_hotkey_index(index);
     }
+    // Showing the persisted value (or the default) in the SpinBox is a plain
+    // property set; it does not fire the SpinBox's `edited` callback, so no
+    // redundant worker update or save happens at startup.
+    window.set_cps(initial_cps);
     // The ComboBox model is the supported catalog itself, in the same order
     // `ui_index_for_display` uses, so the two can never drift apart.
     let model: Vec<SharedString> = settings::supported_hotkey_displays()
@@ -35,7 +44,7 @@ fn main() -> Result<(), slint::PlatformError> {
         .collect();
     window.set_hotkey_model(slint::VecModel::from_slice(&model));
 
-    let worker = Worker::spawn(DEFAULT_CPS, {
+    let worker = Worker::spawn(initial_cps, {
         let weak = weak.clone();
         // Forward every worker state change onto the Slint UI thread using the
         // supported cross-thread event-loop invocation mechanism. The weak
@@ -67,6 +76,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let toggle_handle = worker.handle().clone();
     let hotkey_handle = worker.handle().clone();
+    let cps_handle = worker.handle().clone();
     let hotkey = Hotkey::spawn(initial, {
         let weak = weak.clone();
         let handle = hotkey_handle;
@@ -167,8 +177,28 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     window.on_toggle_clicking(move || toggle_handle.toggle());
-    let cps_handle = worker.handle().clone();
-    window.on_cps_changed(move |value: i32| cps_handle.set_cps(value));
+    window.on_cps_changed({
+        let weak = weak.clone();
+        move |value: i32| {
+            // Validate into the supported range before sending and storing:
+            // the same clamped value reaches the worker and the registry, so
+            // a stored value is always in range.
+            let cps = validate_cps(value);
+            cps_handle.set_cps(cps);
+            // Persist the new rate. A failed save must not break clicking:
+            // report it in the UI and say exactly that it was not saved,
+            // rather than claiming it was.
+            if let Err(error) = settings::save_cps(cps) {
+                let weak = weak.clone();
+                let message = format!("The click rate could not be saved: {error}");
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_input_error(SharedString::from(message));
+                    }
+                });
+            }
+        }
+    });
 
     let run_result = window.run();
 
