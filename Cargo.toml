@@ -11,3 +11,6 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Input_
 
 [build-dependencies]
 slint-build = "1.18.1"
+
+[profile.release]
+strip = true
