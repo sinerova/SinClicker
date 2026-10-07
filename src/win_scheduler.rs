@@ -10,7 +10,7 @@
 //! ## Wake strategy (a ladder, best first)
 //!
 //! The old `mpsc::recv_timeout` wait was quantized to the system timer tick
-//! (a few milliseconds), which capped a 10 ms (100 CPS) interval at roughly
+//! (a few milliseconds), which capped the 10 ms (100 CPS) interval at roughly
 //! 60–65 clicks/second in measurement. A waitable timer wakes on the requested
 //! deadline, which lifts that ceiling. Three options are tried at startup, in
 //! order, and the first that succeeds is used. None change the global timer
@@ -18,8 +18,9 @@
 //!
 //! 1. **High-resolution waitable timer**
 //!    (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1607+): wakes on the
-//!    deadline with sub-millisecond precision, so a 10 ms interval can reach
-//!    the full 100 clicks/second.
+//!    deadline with sub-millisecond precision, so even the shortest supported
+//!    interval, the 2 ms of the 500 CPS maximum, is within the wake
+//!    mechanism's capability.
 //! 2. **Standard waitable timer**: wakes on the deadline but only to the
 //!    system timer resolution (often a few milliseconds). A note is logged so
 //!    a reduced high rate is never silently promised.
@@ -203,7 +204,7 @@ impl WakeSource {
                          standard waitable timer unavailable ({standard_error}); \
                          falling back to a plain bounded wait: the click rate is then limited \
                          by the system timer resolution (a few milliseconds), so the requested \
-                         rate may not be reached — 100 CPS in particular will run well below \
+                         rate may not be reached — 500 CPS in particular will run well below \
                          its target. This does not change the system timer resolution."
                     );
                     (None, TimerKind::EventOnly)
@@ -526,6 +527,63 @@ mod tests {
         assert!(
             effective >= 90.0,
             "a high-resolution timer should wake near 100/s; measured {effective:.1} wake/s \
+             ({cycles} in {took:.2?} s)"
+        );
+    }
+
+    /// Measures the real wake mechanism at the shortest supported interval,
+    /// 2 ms (500 CPS), without sending any input — the top of the supported
+    /// range. Bounded like the 10 ms probe: a fixed one-second window and a
+    /// wait that always returns on its own deadline, a command signal, or the
+    /// safety bound.
+    ///
+    /// The assertion is a soft floor (90% of the requested 500/s): a
+    /// high-resolution timer should wake near 500/s; a system whose timer
+    /// granularity is coarser than 2 ms is expected to fall short — that is
+    /// the documented, logged limitation of that strategy, and a failure
+    /// here on such a machine is informative about the hardware, not a
+    /// regression in the scheduling math.
+    #[test]
+    fn the_wait_backend_meets_most_of_a_500cps_interval() {
+        const PROBE_US: u64 = 1_000_000; // measure over a one-second window
+        const INTERVAL_US: u64 = 2_000; // 2 ms interval -> 500 CPS target
+        let mut src = WakeSource::new();
+        let window_start = src.now_micros();
+        let mut next_due = window_start; // first deadline is immediate
+        let mut cycles = 0u32;
+        let start = std::time::Instant::now();
+        loop {
+            let now = src.now_micros();
+            // Stop once the one-second window has elapsed.
+            if now.saturating_sub(window_start) >= PROBE_US {
+                break;
+            }
+            if now >= next_due {
+                cycles += 1;
+                next_due = next_due.saturating_add(INTERVAL_US);
+                // Never emit a catch-up burst: roll any lapsed deadlines
+                // forward instead of firing them one by one.
+                while next_due <= src.now_micros() {
+                    next_due = next_due.saturating_add(INTERVAL_US);
+                }
+            } else {
+                assert_eq!(
+                    src.wait_for(next_due - now),
+                    Wake::Elapsed,
+                    "the wait must not fail under normal operation"
+                );
+            }
+        }
+        let took = start.elapsed().as_secs_f64();
+        let effective = cycles as f64 / took;
+        eprintln!(
+            "scheduler-wake probe: {kind:?}, {cycles} cycles in {took:.2?} s \
+             ({effective:.1} wake/s at a 2 ms target)",
+            kind = src.timer_kind()
+        );
+        assert!(
+            effective >= 450.0,
+            "a high-resolution timer should wake near 500/s; measured {effective:.1} wake/s \
              ({cycles} in {took:.2?} s)"
         );
     }

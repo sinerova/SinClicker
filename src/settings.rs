@@ -1,5 +1,5 @@
 //! Settings: the supported hotkey catalog, display formatting/parsing, and
-//! persistence of the chosen binding.
+//! persistence of the chosen binding and the CPS value.
 //!
 //! Everything besides the registry I/O is pure and unit-tested; no test
 //! registers a hotkey or sends input.
@@ -90,6 +90,18 @@ pub const SUPPORTED_HOTKEYS: [HotkeyChoice; 23] = [
 /// The default display string; also the first (index 0) UI choice.
 pub const DEFAULT_HOTKEY_DISPLAY: &str = "Ctrl+Alt+F6";
 
+/// Resolves a persisted CPS value to the CPS the application starts with: a
+/// stored value inside the supported range is used as-is; `None` (missing or
+/// unreadable storage) and any out-of-range number fall back to the default.
+/// Pure, so the out-of-range fallback is unit-tested without registry access.
+pub fn resolve_startup_cps(stored: Option<i32>) -> i32 {
+    use crate::clicker::{DEFAULT_CPS, MAX_CPS, MIN_CPS};
+    match stored {
+        Some(value) if (MIN_CPS..=MAX_CPS).contains(&value) => value,
+        None | Some(_) => DEFAULT_CPS,
+    }
+}
+
 /// Canonical display strings of all supported hotkeys, in UI order.
 pub fn supported_hotkey_displays() -> Vec<&'static str> {
     SUPPORTED_HOTKEYS.iter().map(|h| h.display).collect()
@@ -168,6 +180,8 @@ pub fn format_display(ctrl: bool, alt: bool, shift: bool, key: &str) -> String {
 pub const SETTINGS_SUBKEY: &str = "Software\\SinClicker";
 #[cfg(target_os = "windows")]
 const HOTKEY_VALUE: &str = "Hotkey";
+#[cfg(target_os = "windows")]
+const CPS_VALUE: &str = "Cps";
 
 /// A NUL-terminated UTF-16 string on a `Vec` that stays alive for a call.
 #[cfg(target_os = "windows")]
@@ -320,9 +334,143 @@ pub fn save_hotkey_display(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads the persisted CPS value, or `None` when nothing usable is stored or
+/// reading fails (first launch, missing value, wrong type, wrong size, or a
+/// registry error). Range checking is the caller's job; this function does not
+/// trust the stored number to be in range.
+#[cfg(target_os = "windows")]
+pub fn load_cps() -> Option<i32> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+        REG_VALUE_TYPE,
+    };
+
+    let mut subkey = WideString::new(SETTINGS_SUBKEY);
+    let mut value = WideString::new(CPS_VALUE);
+    let mut hkey: HKEY = unsafe { core::mem::zeroed() };
+
+    // SAFETY: `RegOpenKeyExW` writes the opened key handle into `hkey`; the
+    // subkey is a live NUL-terminated UTF-16 string. `WIN32_ERROR(0)` means
+    // success.
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.ptr(),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+    }
+    .0 != 0
+    {
+        return None;
+    }
+
+    let result = (|| -> Option<i32> {
+        // SAFETY: a fixed 4-byte buffer with a size out-param queries the
+        // stored value; `data_type` outlives the query.
+        let mut data_type: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
+        let mut raw: [u8; 4] = [0; 4];
+        let mut size: u32 = 4;
+        let code = unsafe {
+            RegQueryValueExW(
+                hkey,
+                value.ptr(),
+                None,
+                Some(&mut data_type),
+                Some(raw.as_mut_ptr()),
+                Some(&mut size),
+            )
+        }
+        .0;
+        // A REG_DWORD holds exactly 4 bytes of payload; any other size or
+        // type is malformed and must fall back to the default.
+        if code != 0 || size != 4 || data_type != REG_DWORD {
+            return None;
+        }
+        Some(i32::from_le_bytes(raw))
+    })();
+
+    // SAFETY: `hkey` was opened above; this is its last use.
+    let _ = unsafe { RegCloseKey(hkey) };
+    result
+}
+
+/// Persists the CPS value as a REG_DWORD under the same per-user key as the
+/// hotkey. The returned error carries the failing Win32 code so the caller can
+/// surface it; the app keeps working either way.
+#[cfg(target_os = "windows")]
+pub fn save_cps(cps: i32) -> Result<(), String> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+        REG_DWORD, REG_OPTION_NON_VOLATILE,
+    };
+
+    let mut subkey = WideString::new(SETTINGS_SUBKEY);
+    let mut value_name = WideString::new(CPS_VALUE);
+    let data: [u8; 4] = cps.to_le_bytes();
+
+    let mut hkey: HKEY = unsafe { core::mem::zeroed() };
+    // SAFETY: `RegCreateKeyExW` writes the created/opened key into `hkey`; the
+    // subkey is a live NUL-terminated UTF-16 string; a null class name and
+    // null security attributes are acceptable per the Win32 contract.
+    // `WIN32_ERROR(0)` means success.
+    let create = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.ptr(),
+            Some(0),
+            windows::core::PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if create.0 != 0 {
+        return Err(format!(
+            "could not open the settings key (Windows error code {:#x})",
+            create.0
+        ));
+    }
+
+    // SAFETY: `data` is 4 bytes (the REG_DWORD payload) and outlives the call.
+    let set = unsafe { RegSetValueExW(hkey, value_name.ptr(), None, REG_DWORD, Some(&data)) };
+    // SAFETY: `hkey` was opened above; this is its last use.
+    let _ = unsafe { RegCloseKey(hkey) };
+    if set.0 != 0 {
+        return Err(format!(
+            "could not save the click rate (Windows error code {:#x})",
+            set.0
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clicker::{DEFAULT_CPS, MAX_CPS, MIN_CPS};
+
+    #[test]
+    fn resolve_startup_cps_uses_a_stored_in_range_value() {
+        assert_eq!(resolve_startup_cps(Some(MIN_CPS)), MIN_CPS);
+        assert_eq!(resolve_startup_cps(Some(DEFAULT_CPS)), DEFAULT_CPS);
+        assert_eq!(resolve_startup_cps(Some(MAX_CPS)), MAX_CPS);
+        assert_eq!(resolve_startup_cps(Some(250)), 250);
+        assert_eq!(resolve_startup_cps(Some(499)), 499);
+    }
+
+    #[test]
+    fn resolve_startup_cps_falls_back_to_the_default() {
+        assert_eq!(resolve_startup_cps(None), DEFAULT_CPS);
+        assert_eq!(resolve_startup_cps(Some(MIN_CPS - 1)), DEFAULT_CPS);
+        assert_eq!(resolve_startup_cps(Some(0)), DEFAULT_CPS);
+        assert_eq!(resolve_startup_cps(Some(MAX_CPS + 1)), DEFAULT_CPS);
+        assert_eq!(resolve_startup_cps(Some(i32::MIN)), DEFAULT_CPS);
+        assert_eq!(resolve_startup_cps(Some(i32::MAX)), DEFAULT_CPS);
+    }
 
     #[test]
     fn catalog_has_expected_size_and_order() {

@@ -14,21 +14,21 @@ use crate::win_input::left_mouse_down_up;
 use crate::win_scheduler::{CommandEvent, Wake, WakeSource, IDLE_WAIT_MICROS};
 
 pub const MIN_CPS: i32 = 1;
-pub const MAX_CPS: i32 = 100;
+pub const MAX_CPS: i32 = 500;
 pub const DEFAULT_CPS: i32 = 10;
 
-/// Clamps an arbitrary CPS value into the supported 1..=100 range.
+/// Clamps an arbitrary CPS value into the supported 1..=500 range.
 ///
 /// This enforces the spec range in Rust even though the UI SpinBox already
 /// restricts it.
 pub fn validate_cps(cps: i32) -> i32 {
-    // MIN_CPS (1) < MAX_CPS (100), so clamp cannot panic.
+    // MIN_CPS (1) < MAX_CPS (500), so clamp cannot panic.
     cps.clamp(MIN_CPS, MAX_CPS)
 }
 
 /// Returns the time to wait between clicks for a CPS value that has been
-/// clamped (or is already in range) to 1..=100. A CPS of 1 waits 1 second;
-/// a CPS of 100 waits 10 milliseconds.
+/// clamped (or is already in range) to 1..=500. A CPS of 1 waits 1 second;
+/// a CPS of 500 waits 2 milliseconds.
 pub fn click_interval(cps: i32) -> Duration {
     Duration::from_secs_f64(1.0 / validate_cps(cps) as f64)
 }
@@ -402,15 +402,15 @@ mod tests {
 
     #[test]
     fn cps_above_range_is_clamped_down() {
-        assert_eq!(validate_cps(101), 100);
-        assert_eq!(validate_cps(10_000), 100);
-        assert_eq!(click_interval(101), Duration::from_millis(10));
-        assert_eq!(click_interval_micros(101), 10_000);
+        assert_eq!(validate_cps(501), 500);
+        assert_eq!(validate_cps(10_000), 500);
+        assert_eq!(click_interval(501), Duration::from_millis(2));
+        assert_eq!(click_interval_micros(501), 2_000);
     }
 
     #[test]
     fn cps_in_range_is_kept() {
-        for cps in [1, 2, 10, 50, 99, 100] {
+        for cps in [1, 2, 10, 50, 99, 100, 250, 499, 500] {
             assert_eq!(validate_cps(cps), cps);
         }
     }
@@ -420,6 +420,7 @@ mod tests {
         assert_eq!(click_interval(1), Duration::from_secs(1));
         assert_eq!(click_interval(10), Duration::from_millis(100));
         assert_eq!(click_interval(100), Duration::from_millis(10));
+        assert_eq!(click_interval(500), Duration::from_millis(2));
         assert!(click_interval(2) < Duration::from_secs(1));
     }
 
@@ -427,7 +428,7 @@ mod tests {
     fn interval_microseconds_are_inverse_of_cps() {
         // `click_interval_micros` floors `1_000_000 / cps`, so the product
         // `micro * cps` is within `cps - 1` of one second (never above it).
-        for cps in 1..=100i32 {
+        for cps in 1..=500i32 {
             let micro = click_interval_micros(cps);
             let under_one_second = micro * cps as u64 <= 1_000_000;
             assert!(
@@ -435,6 +436,7 @@ mod tests {
                 "cps {cps}: {micro} µs is not ~1s"
             );
         }
+        assert_eq!(click_interval_micros(500), 2_000);
         assert_eq!(click_interval_micros(100), 10_000);
         assert_eq!(click_interval_micros(1), 1_000_000);
         assert_eq!(click_interval_micros(3), 333_333); // floor, never up
@@ -479,6 +481,26 @@ mod tests {
             (95..=105).contains(&clicks),
             "at 100 CPS, one second should yield ~100 clicks, got {clicks}"
         );
+    }
+
+    #[test]
+    fn the_top_rate_of_500_clicks_per_second_is_scheduled_exactly() {
+        // 500 CPS is the range maximum and its exact 2 ms interval divides
+        // one second evenly, so the schedule is exact (no rounding loss).
+        assert_eq!(click_interval_micros(500), 2_000);
+        let clicks = simulate(500, 1_000_000, &[]);
+        assert_eq!(
+            clicks, 500,
+            "at 500 CPS, one second should yield exactly 500 clicks, got {clicks}"
+        );
+        // A CPS change up to the top of the range applies within one new
+        // (2 ms) interval.
+        let mut sched = ClickScheduler::new(10); // 100 ms interval
+        sched.start(0);
+        sched.advance(0); // click at 0, next deadline 100_000
+        sched.set_cps(500, true, 20_000);
+        assert_eq!(sched.next_deadline_us(), Some(22_000));
+        assert_eq!(sched.wait_us(true, 20_000), 2_000);
     }
 
     #[test]

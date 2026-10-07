@@ -310,12 +310,104 @@
   Nothing in the code path that produced the Milestone-5 45/45 changed in a way
   that would alter that count.
 
+## Milestone 7 — done (CPS range 1–500 + CPS persistence)
+
+Branch `feature/cps-500-persist` (work in progress; not committed).
+
+- What changed (all in the working tree, 8 modified + 1 new file):
+  - `src/clicker.rs`: `MAX_CPS` 100 → **500**; `validate_cps` clamps to 1..=500;
+    unit tests updated (2 ms at 500 CPS, full inverse over 1..=500, exact
+    500-click one-second simulation, top-of-range CPS change applies within one
+    new interval). `DEFAULT_CPS` stays 10.
+  - `src/settings.rs`: new CPS persistence on top of the existing hotkey
+    persistence — `save_cps(i32)` writes `HKCU\Software\SinClicker\Cps` as a
+    **REG_DWORD** (the same per-user key, so no elevation), `load_cps()` reads
+    it back and returns `None` for a missing value, a wrong type, a wrong size
+    (not exactly 4 bytes), or a registry error; and pure
+    `resolve_startup_cps(Option<i32> -> i32)` maps stored → start value
+    (in range kept, `None`/out-of-range → `DEFAULT_CPS`). Unit tests for
+    `resolve_startup_cps` cover in-range and every fallback class
+    (including `i32::MIN`/`i32::MAX`).
+  - `src/main.rs`: startup wiring — `resolve_startup_cps(load_cps())` is
+    computed once before `MainWindow::new()`, and that single value is used to
+    both initialize the UI (`window.set_cps`) and the worker
+    (`Worker::spawn`), so UI and scheduler cannot drift at startup. A plain
+    SpinBox property set does not fire `edited`, so showing the restored value
+    causes no redundant `set_cps`/save. `on_cps_changed` now also
+    `save_cps` and surfaces the Win32 error in the existing input-error line
+    when a save fails (the app keeps running; the in-session rate still
+    applies).
+  - `ui/app.slint`: SpinBox `maximum: 100` → `500`; `cps` default 10.
+  - `src/win_scheduler.rs`: new bounded test — a 25 ms probe at the 2 ms /
+    500 CPS target on the real wake backend; on this machine (which selects
+    the high-resolution timer) it asserts the wake path stays within a
+    generous bound, mirroring the existing 100 CPS wake probe.
+  - `tests/rate_validation.rs`: range tests updated to 1–500 (bounds,
+    clamp-down at 501, 2 ms interval).
+  - `tests/cps_persistence.rs` (new): one sequential integration test against
+    the **real** per-user registry, with a drop-guard that restores the user's
+    prior value (type + payload bytes, or absence) on the way out, even if an
+    assert panics. Covers: in-range round-trips (1, 10, 500, 250) through the
+    real `save_cps`/`load_cps`/`resolve_startup_cps` path; absent value →
+    `None` → default; out-of-range stored values (0, 501, 999) are stored
+    verbatim by the public API but resolve to the default.
+  - `README.md` / `SPEC.md`: range documented as 1–500; persistence stated as
+    "the hotkey choice and the CPS value"; the 500 CPS figure carries the
+    honest caveat that the 2 ms request depends on Windows scheduling and the
+    target's own input handling (SPEC "Safety" section: the app reports only
+    what `SendInput` accepted, and never claims more).
+- Storage contract: `HKCU\Software\SinClicker`, value `Cps`, type `REG_DWORD`
+  (exactly 4 bytes, little-endian i32). Any deviation (missing value,
+  `REG_SZ`, `REG_QWORD`, 8-byte payload, out-of-range number) is read as
+  unusable and the app starts at 10 CPS. The hotkey value (`Hotkey`, REG_SZ)
+  is untouched.
+- Verification — UI-level, against the freshly built release binary:
+  a throwaway C# / .NET 4.0 x64 helper (under `%TEMP%`, outside the repo)
+  uses the legacy UIA client API on the winit/Slint window: Slint 1.18.1's
+  default features include `accessibility`, so the SpinBox is exposed as a
+  UIA `Spinner` with a Value pattern (`accessible-action-set-value` → the
+  Slint SpinBox `update-value`, which fires `edited` inside the 1–500 range —
+  i.e. a UIA value set goes through the app's real change path, including its
+  save). The app is launched, its window is found by title, the Spinner is
+  located in the tree, and its value is read or set; the app is then closed
+  with the UIA `WindowPattern.Close()` (graceful) and the process reaped.
+  The scenario matrix, 9/9 PASS (2026-10-06):
+  - stored 200 → starts at 200 (read back via UIA);
+  - UIA set 200 → 250: registry becomes `Cps = 250` REG_DWORD, relaunch → UIA
+    reads 250 (full save + restore round-trip through the UI);
+  - UIA set 250 → 500: same round-trip at the range top;
+  - stored value absent → starts at 10;
+  - stored 0, 501, 999 (REG_DWORD) → start at 10;
+  - stored `REG_SZ` "250" → starts at 10;
+  - stored `REG_QWORD` 250 → starts at 10.
+  Each launch exited cleanly (WindowPattern close, no forced kills), and the
+  user's original value (`Cps = 200` REG_DWORD, no `Hotkey` value) was
+  restored after the matrix.
+  The UIA harness launches the real app, which registers its persisted global
+  hotkey (default `Ctrl+Alt+F6`) — accepted as the app-under-test's own
+  behaviour; the harness never presses the hotkey and the app starts stopped,
+  so no clicks are sent.
+- Checks (all pass, 2026-10-06): `cargo fmt --check`,
+  `cargo check --all-targets`, `cargo test` (39 lib unit + 4 integration,
+  including the new `cps_persistence` test and the 500 CPS wake probe),
+  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`.
+- Not run here (carried from earlier milestones, unchanged by this work):
+  re-running the Milestone-5 45/45 harness in a fresh fully-interactive
+  console; UIPI input into a higher-integrity target (needs elevation the
+  harness avoids); live light/dark re-toggle.
+- Environment note: the working tree contains a pre-existing nested clone at
+  `SinClicker\` (its own `.git`, remote `sinerova/SinClicker`, tracked files
+  only `.gitattributes` + `README.md`; it does not appear in `git status`,
+  and no deletion was performed). It is unrelated to this milestone.
+
 ## Status
 
-Milestones 1–6 complete: SPEC.md v1 scope (window, clicker, global hotkey)
-plus supported-list hotkey customization with persistence are implemented and
-verified end-to-end against the release binary. The click scheduler now runs a
-wake-based backend (waitable timer + command-event wake, QPC `Instant` deadline
-clock) that reaches the full 100 CPS in the in-process rate probe (100.0
-wake/s), where the prior `recv_timeout` design was quantized to ~60–65/s.
-No further milestones planned unless new requirements arrive.
+Milestones 1–7 complete on the working branch: SPEC.md v1 scope (window,
+clicker, global hotkey) plus supported-list hotkey customization with
+persistence, and the CPS range 1–500 with CPS persistence, are implemented
+and verified — end-to-end for hotkey behaviour (Milestone 5) and for CPS
+persistence via the UIA matrix above. The click scheduler runs the wake-based
+backend (waitable timer + command-event wake, QPC `Instant` deadline clock):
+full 100 CPS in the in-process wake probe (100.0 wake/s) and a bounded 500
+CPS (2 ms) wake probe. The branch is uncommitted; nothing here changes the
+click or hotkey code paths beyond the range widening.
