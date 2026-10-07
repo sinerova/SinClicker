@@ -46,16 +46,20 @@ and arbitrary combinations are not accepted. The chosen binding persists
 across launches.
 
 Do not add a system-tray icon, startup-on-login, profiles, click-location
-selection, multiple mouse buttons, or settings persistence (beyond the hotkey
-choice) in this version.
+selection, or multiple mouse buttons in this version. The settings that are
+persisted are the hotkey choice and the CPS value.
 
 ## Click rate
 
-- Provide a CPS range of **1–100**.
+- Provide a CPS range of **1–500**.
 - Enforce the range in Rust even if the UI control already restricts it.
-- Initialize the app to **10 CPS**.
+- Initialize the app to **10 CPS** and restore the user's last CPS value on
+  launch; a stored value that is missing, malformed, or out of range falls
+  back to the 10 CPS default.
 - At a CPS value `n`, schedule one left click approximately every `1/n`
-  seconds.
+  seconds. At the 500 CPS maximum the requested interval is 2 ms; whether the
+  system actually clicks that fast is subject to Windows scheduling (see
+  below).
 - Send a left-button down/up pair with Windows `SendInput`.
 - Send each down/up pair together where the API permits, to reduce the chance
   of a stuck button or interleaving input.
@@ -64,7 +68,13 @@ choice) in this version.
 - Changing CPS while clicking should update the rate without requiring a
   restart.
 - The actual timing is subject to Windows scheduling and is not guaranteed to
-  have real-time precision.
+  have real-time precision. At high rates the 2 ms request at 500 CPS depends
+  on the scheduler being able to wake every 2 ms: with the high-resolution
+  waitable timer this is within reach on modern Windows, but on a system
+  whose waitable timers are limited to the coarser system timer resolution
+  (or under UIPI/scheduling load) the delivered rate can fall below the
+  requested one. Nothing here promises that every target application will
+  observe exactly 500 clicks per second.
 
 Clicks should happen at the current pointer position; do not move the pointer.
 
@@ -147,6 +157,11 @@ safety assumptions around each unsafe block.
 `SendInput` is subject to Windows User Interface Privilege Isolation (UIPI).
 The app must not elevate itself or claim it can click into every application.
 Explain that Windows can block input to a higher-integrity application.
+
+At the 500 CPS maximum, each left down/up pair is still sent with `SendInput`,
+and the target application's own input processing (and any UIPI filtering)
+determines how many of the requested clicks per second it actually records.
+The app reports only what `SendInput` accepted; it never claims more.
 
 ## Out of scope
 
