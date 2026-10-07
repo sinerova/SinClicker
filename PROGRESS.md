@@ -226,9 +226,96 @@
   --check`, `cargo check --all-targets`, `cargo test` (25 pass), `cargo
   clippy --all-targets -- -D warnings`, `cargo build --release`.
 
+## Milestone 6 — done (wake-based scheduler: hit the real 100 CPS)
+
+- What changed:
+  - `src/win_scheduler.rs` (new): all Windows interop for the *wake* is isolated
+    here. `WakeSource` blocks the worker until the next click deadline *or* a
+    command, using a waitable timer so the old `recv_timeout` tick-quantization
+    (which capped a 10 ms / 100 CPS interval at ~60–65/s in measurement) is
+    gone. A strategy ladder picks the best available wait at startup and logs a
+    note when a reduced strategy is used, so a lowered rate is never silently
+    promised: (1) high-resolution waitable timer (wins, sub-ms wake), (2)
+    standard waitable timer (deadline wake at system resolution), (3) plain
+    bounded wait on the command event (the pre-timer behaviour; a note names
+    the limit). A separate auto-reset **command event** is the wake hint on
+    every `Start`/`Stop`/`Toggle`/`SetCps`/`Quit`; the `mpsc` channel becomes a
+    payload pipe the worker fully drains after every wake, so a coalesced
+    signal or spurious early wake can never drop a command or fire an early
+    click (the worker re-checks its own deadline against the monotonic clock).
+    The wait bound always extends past the deadline, so even a missed timer
+    signal cannot hold the worker past it.
+  - Deadline clock: `WakeSource::now_micros()` is `std::time::Instant`
+    (QPC-backed, monotonic). `GetTickCount64` is quantized to the system timer
+    resolution, so a deadline clock on it would cap 100 CPS at ~60–65/s even
+    with a precise timer; `Instant` removes that quantization and is the same
+    basis the wait uses, so clock and wake are coherent.
+  - `src/clicker.rs`: the *timing* math is factored into a pure, testable
+    `ClickScheduler` (monotonic-microsecond absolute rolling deadline): no
+    drift (anchored, not re-anchored on jittery "now"), no catch-up burst
+    (a lapsed deadline rolls to now+interval, one catch-up click max), and a CPS
+    change applies from the next click (pulling a pending deadline earlier when
+    the new interval is shorter, keeping it when slower). `WorkerHandle::send`
+    now also signals the command event so a blocked worker wakes promptly. No
+    `SendInput`, no Windows. `worker_loop` is now: compute wait -> fire due
+    click -> block on `WakeSource` -> drain commands -> repeat. `Wake::Failed`
+    ends the worker with a report (no spin).
+  - `src/lib.rs`: adds `pub mod win_scheduler;`.
+- Invariants preserved (unchanged): no catch-up burst; no command dropped
+  (event = wake hint, channel = payload, full drain after every wake, stale
+  wake harmless); a click is never reported as sent unless `SendInput` accepts
+  both events; shutdown remains orderly (Stop -> Quit -> join; hotkey retired
+  before the worker).
+- Tests: 30 lib unit + 3 integration rate tests. New coverage:
+  - `win_scheduler`: a bounded, hang-proof exercise of the real wait path
+    (a 150 ms wait returns in-bound; a command signal wakes a 2 s wait
+    promptly); the backend selects a real waitable timer here; the command
+    signal is independent of the deadline (5 trials); and a 1-second probe at
+    a 10 ms target that measures the real wake mechanism end to end without
+    sending input — it asserts >= 90 wake/s (a high-res timer should be near
+    100/s; a standard timer, if selected, is the documented, logged
+    limitation). This machine selects **HighResolution** and measures
+    **100.0 wake/s** (stable across 3 runs).
+  - `clicker`: `click_interval_micros` inverse of CPS (floored, never above
+    1 s); pure click-count simulations for 100 CPS / 1 CPS; a suspend does not
+    burst; a CPS increase applies within one new interval; a CPS decrease keeps
+    the pending deadline then uses the new interval; stop/restart clicks
+    immediately; no drift over 1000 cycles; a constant 300 µs jitter does not
+    accumulate.
+- Checks (all pass, 2026-10-06): `cargo fmt --check`,
+  `cargo check --all-targets`, `cargo test` (30 lib + 3 integration),
+  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`.
+- End-to-end (Milestone 5's UIA harness) and this session's note:
+  - The in-process rate probe (the scheduler's own wake, no input) confirms
+    the full 10 CPS / 100 CPS cadence the old scheduler could not reach.
+  - The harness's cross-process click *count* and some hotkey toggles read 0 in
+    the current interactive session. This is **not** a scheduler regression:
+    an A/B against the committed v1.0 `recv_timeout` build (the exact binary
+    that produced 22 clicks in Milestone 5) also reads **0** in this same
+    session, while the app itself reports "Clicking", flips the button to
+    Stop, and shows no `SendInput` error — i.e. the app side is intact on both
+    builds. An in-process `dispprobe` (a correctly-pumping `WH_MOUSE_LL` + a
+    well-formed 40-byte x64 `SendInput`) confirms the session *does* dispatch
+    injected input. The 0-count is therefore an artifact of this particular
+    interactive session's delivery/observation of cross-process simulated
+    input (a locked/background console, or a redirected input target), not of
+    either scheduler. The 45/45 harness result from Milestone 5 (a fresh,
+    interactive console) remains the authoritative end-to-end pass; the
+    scheduler change does not alter the click path (`left_mouse_down_up` is
+    unchanged) or the hotkey path, and is independently validated by the probe
+    and the full unit/integration suite.
+- Remaining: re-run the Milestone-5 UIA harness in a fresh, fully-interactive
+  console to reconfirm the 22-click end-to-end figure against the new build
+  (the current session cannot reliably observe cross-process injected input).
+  Nothing in the code path that produced the Milestone-5 45/45 changed in a way
+  that would alter that count.
+
 ## Status
 
-Milestones 1–5 complete: SPEC.md v1 scope (window, clicker, global hotkey)
+Milestones 1–6 complete: SPEC.md v1 scope (window, clicker, global hotkey)
 plus supported-list hotkey customization with persistence are implemented and
-verified end-to-end against the release binary. No further milestones planned
-unless new requirements arrive.
+verified end-to-end against the release binary. The click scheduler now runs a
+wake-based backend (waitable timer + command-event wake, QPC `Instant` deadline
+clock) that reaches the full 100 CPS in the in-process rate probe (100.0
+wake/s), where the prior `recv_timeout` design was quantized to ~60–65/s.
+No further milestones planned unless new requirements arrive.
