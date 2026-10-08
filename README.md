@@ -10,6 +10,10 @@ simulated input from reaching higher-integrity applications, and whether
 the full 500 clicks per second actually reach the target depends on
 Windows scheduling and the target's own input handling.
 
+## Screenshot
+
+![SinClicker screenshot](screenshots/screenshot.png)
+
 ## Tech
 
 - Language: Rust
