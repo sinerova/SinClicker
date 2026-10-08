@@ -3,9 +3,12 @@
 A small Windows-only autoclicker. It sends left mouse button clicks at
 the current pointer position at an adjustable rate (1–500 clicks per
 second). Clicking is started and stopped from the window, and a global
-hotkey (default Ctrl+Alt+F6) toggles clicking from anywhere. The chosen
-hotkey and click rate are saved and restored across launches. The app
-does not require administrator privileges; note that Windows may block
+hotkey (default Ctrl+Alt+F6) toggles clicking from anywhere. The window
+also shows the target interval between clicks (1000/CPS milliseconds)
+beside the click-rate control; it is the nominal target, not a
+measurement of actual click timing. The
+chosen hotkey and click rate are saved and restored across launches. The
+app does not require administrator privileges; note that Windows may block
 simulated input from reaching higher-integrity applications, and whether
 the full 500 clicks per second actually reach the target depends on
 Windows scheduling and the target's own input handling.

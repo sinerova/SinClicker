@@ -40,6 +40,24 @@ pub fn click_interval_micros(cps: i32) -> u64 {
     1_000_000 / validate_cps(cps) as u64
 }
 
+/// The target interval per click for a CPS value, as a display string in
+/// milliseconds: `1000/CPS`, clamped into the supported range and rounded to
+/// one decimal place (`3 CPS` -> `333.3 ms`, `16 CPS` -> `62.5 ms`,
+/// `160 CPS` -> `6.3 ms`). Values that round to a whole number of
+/// milliseconds are shown without a decimal point (`500 CPS` -> `2 ms`,
+/// `167 CPS` -> `6 ms`).
+pub fn target_interval_display(cps: i32) -> String {
+    let cps = validate_cps(cps) as u64;
+    // The interval in tenths of a millisecond, rounded half-up:
+    // `round(10000/cps) = (20000 + cps) / (2 * cps)` in integer math.
+    let tenths = (20_000 + cps) / (2 * cps);
+    if tenths.is_multiple_of(10) {
+        format!("{} ms", tenths / 10)
+    } else {
+        format!("{}.{} ms", tenths / 10, tenths % 10)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Start,
@@ -440,6 +458,48 @@ mod tests {
         assert_eq!(click_interval_micros(100), 10_000);
         assert_eq!(click_interval_micros(1), 1_000_000);
         assert_eq!(click_interval_micros(3), 333_333); // floor, never up
+    }
+
+    #[test]
+    fn target_interval_display_shows_milliseconds_per_click() {
+        assert_eq!(target_interval_display(1), "1000 ms");
+        assert_eq!(target_interval_display(3), "333.3 ms");
+        assert_eq!(target_interval_display(7), "142.9 ms");
+        assert_eq!(target_interval_display(10), "100 ms");
+        assert_eq!(target_interval_display(16), "62.5 ms");
+        assert_eq!(target_interval_display(25), "40 ms");
+        assert_eq!(target_interval_display(30), "33.3 ms");
+        assert_eq!(target_interval_display(100), "10 ms");
+        assert_eq!(target_interval_display(160), "6.3 ms"); // exact half, rounded up
+        assert_eq!(target_interval_display(167), "6 ms"); // rounds to a whole ms
+        assert_eq!(target_interval_display(250), "4 ms");
+        assert_eq!(target_interval_display(500), "2 ms");
+    }
+
+    #[test]
+    fn target_interval_display_clamps_out_of_range_cps() {
+        assert_eq!(target_interval_display(0), target_interval_display(1));
+        assert_eq!(target_interval_display(-5), "1000 ms");
+        assert_eq!(target_interval_display(501), target_interval_display(500));
+        assert_eq!(target_interval_display(10_000), "2 ms");
+    }
+
+    #[test]
+    fn target_interval_display_matches_the_true_interval_for_every_cps() {
+        // The display must equal the true 1000/cps value rounded to one
+        // decimal place. The reference is computed independently with IEEE
+        // doubles: the only exact halves (where `10000/cps = k + 1/2`) are
+        // exactly representable, and no other value lies close enough to a
+        // rounding boundary for double error to matter at cps <= 500.
+        for cps in 1..=500i32 {
+            let tenths = (10_000.0 / cps as f64).round() as u64;
+            let expected = if tenths.is_multiple_of(10) {
+                format!("{} ms", tenths / 10)
+            } else {
+                format!("{}.{} ms", tenths / 10, tenths % 10)
+            };
+            assert_eq!(target_interval_display(cps), expected, "for cps {cps}");
+        }
     }
 
     fn simulate(cps: i32, duration_us: u64, cps_changes: &[(u64, i32)]) -> usize {

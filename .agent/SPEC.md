@@ -32,8 +32,11 @@ It should include:
    - `Clicking` when clicking is on.
 3. A clear Start/Stop button.
 4. A CPS control with a visible numeric value.
-5. A display of the global toggle hotkey.
-6. A concise hint that clicking happens at the current pointer position.
+5. A display of the target interval per click in milliseconds (`1000/CPS`);
+   it is a nominal target, not a measurement of actual click timing, and it
+   is shown whether clicking is stopped or running.
+6. A display of the global toggle hotkey.
+7. A concise hint that clicking happens at the current pointer position.
 
 The global hotkey toggles clicking on and off. The in-window button must do the
 same. The hotkey should work while the app window is not focused.

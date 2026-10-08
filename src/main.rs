@@ -5,7 +5,7 @@
 use slint::SharedString;
 use slint::Weak;
 
-use sinclicker::clicker::{validate_cps, Worker, WorkerEvent};
+use sinclicker::clicker::{target_interval_display, validate_cps, Worker, WorkerEvent};
 use sinclicker::hotkey::{Hotkey, HotkeyEvent};
 use sinclicker::settings::{self, DEFAULT_HOTKEY_DISPLAY};
 
@@ -36,6 +36,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // property set; it does not fire the SpinBox's `edited` callback, so no
     // redundant worker update or save happens at startup.
     window.set_cps(initial_cps);
+    // The target interval is derived from the same resolved value, so the
+    // displayed interval matches the rate the worker starts with.
+    window.set_target_interval(SharedString::from(target_interval_display(initial_cps)));
     // The ComboBox model is the supported catalog itself, in the same order
     // `ui_index_for_display` uses, so the two can never drift apart.
     let model: Vec<SharedString> = settings::supported_hotkey_displays()
@@ -185,6 +188,12 @@ fn main() -> Result<(), slint::PlatformError> {
             // a stored value is always in range.
             let cps = validate_cps(value);
             cps_handle.set_cps(cps);
+            // Keep the displayed target interval in step with the exact value
+            // the worker is about to use. The callback already runs on the UI
+            // thread, so the property set needs no event-loop hop.
+            if let Some(window) = weak.upgrade() {
+                window.set_target_interval(SharedString::from(target_interval_display(cps)));
+            }
             // Persist the new rate. A failed save must not break clicking:
             // report it in the UI and say exactly that it was not saved,
             // rather than claiming it was.
