@@ -400,6 +400,63 @@ Branch `feature/cps-500-persist` (work in progress; not committed).
   only `.gitattributes` + `README.md`; it does not appear in `git status`,
   and no deletion was performed). It is unrelated to this milestone.
 
+## Milestone 8 — done (conservative final optimization pass)
+
+Branch `maintenance/final-optimization`, based on `main` @ `c1da89d` (the
+stable production merge; `v1.0`/`v1.0.1` are earlier pre-feature tags). The
+working tree was clean and the baseline unambiguous before any edit.
+
+- Audit (no speculative micro-optimizations; everything below verified
+  against the code, not assumed):
+  - Idle CPU / wakeups: the worker blocks in `WaitForMultipleObjects` (2 s idle
+    bound, auto-reset command event wakes it on any command) and the hotkey
+    thread blocks in `MsgWaitForMultipleObjectsEx(INFINITE)`. No timers, no
+    polling, no animations, no background threads beyond the two required.
+    Nothing to improve.
+  - Timing accuracy: the pure `ClickScheduler` (anchored rolling deadline, one
+    catch-up click max, CPS change applies within one interval) is covered by
+    simulation unit tests plus two live 1 s wake probes on the real backend.
+    Measured on this machine (release build): 100.0 wake/s at the 10 ms
+    target, 500.0 wake/s at the 2 ms target (`HighResolution` strategy). No
+    change needed.
+  - Allocations / dependencies: no per-cycle heap allocations; all six
+    `windows` features are used by the code. No avoidable dependency found.
+    `WindowsError.code` is public-but-unused; kept (it is intentional error
+    payload, and removing it would be a visible API change for zero gain).
+  - Error paths / cleanup: single close site per kernel handle, small `unsafe`
+    with co-located SAFETY comments, `GetLastError` captured before the
+    best-effort release, hotkey retired before the worker on shutdown. No
+    change.
+  - Build configuration: `Cargo.toml` had no release profile. This is the one
+    justified change: `[profile.release] strip = true` for a smaller
+    distributable artifact (the SPEC permits a size-favoring release profile).
+    No runtime behavior, dependency, or feature-set change.
+- Changed files: `Cargo.toml` only (+3 lines). No production code, no feature,
+  no hotkey/settings behavior, no CPS range, no release subsystem attribute
+  (`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`
+  in `main.rs` untouched).
+- Before/after (measured, same machine, interleaved):
+  - Release exe size: 14,566,400 B -> 14,565,888 B (-512 B, -0.0035%). The
+    MSVC link does not embed the PDB into the exe (`target\release\
+    sinclicker.pdb` is still emitted, ~5.2 MB), so stripping only removes the
+    PE symbol table; post-mortem symbols remain available. Tiny but real.
+  - Idle CPU (app stopped, 8 x 2 s `Get-Counter` samples after an 8 s warm-up,
+    2 interleaved rounds per build): baseline 0.0% / 0.0%; strip 0.097% (a
+    single 0.776 transient sample) / 0.0%. No systematic difference; both
+    builds sit fully in kernel waits when idle.
+  - Scheduler wake (release-compiled probes, after the change): 100.0 wake/s
+    at 10 ms, 499.9 wake/s at 2 ms — unchanged in behavior.
+- Validation (all pass, 2026-10-06): `cargo fmt --check`,
+  `cargo check --all-targets`, `cargo test` (39 lib unit + 4 integration),
+  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`.
+- Not run: the Milestone-5 UIA click harness (it sends real clicks; the
+  scheduler/click path is byte-identical in this branch, so its 45/45 result
+  stands); UIPI into an elevated target; live light/dark re-toggle.
+- Conclusion: the production code was already in its conservative end state;
+  the only measurable, zero-risk improvement was the release-profile strip.
+  The branch is ready to merge when the maintainer wants to fold it in
+  (uncommitted, per instruction).
+
 ## Status
 
 Milestones 1–7 complete on the working branch: SPEC.md v1 scope (window,
