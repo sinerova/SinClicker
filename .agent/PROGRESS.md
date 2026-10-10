@@ -457,6 +457,87 @@ working tree was clean and the baseline unambiguous before any edit.
   The branch is ready to merge when the maintainer wants to fold it in
   (uncommitted, per instruction).
 
+## Milestone 9 — done (target-interval display)
+
+Branch `feature/target-interval` from `main` @ `3c39d1b`; the working tree was
+clean when the branch was created.
+
+- What changed:
+  - `src/clicker.rs`: new pure `target_interval_display(cps) -> String` —
+    `1000/CPS` milliseconds, clamped by `validate_cps`, computed in integer
+    math as the true value rounded half-up to one decimal (tenths of a
+    millisecond: `(20000 + cps) / (2 * cps)`). Values that land on a whole
+    millisecond are shown without a decimal point.
+  - `ui/app.slint`: the nominal interval is shown **inline in the CPS row** —
+    the unchanged `SpinBox` (all bounds, callbacks, range untouched) fills an
+    otherwise-transparent `Rectangle` that is the row's stretch cell, and a
+    non-interactive `Text` (`" (" + target-interval + ")"`, 12px) is anchored
+    inside the same control, right of the value, 6px clear of the chevrons
+    (`x: parent.width - 68px - self.width`; the fluent SpinBox's right
+    interior padding is `12px + 28px + 4px + 28px + 2px = 62px`). A plain
+    `Text` has no `TouchArea` and takes no focus, so the SpinBox's editing,
+    keyboard up/down, buttons, and UIA value pattern are unaffected. An
+    earlier iteration used a separate "Target interval" row; on request it was
+    folded into the control itself (the `target-interval` property and the
+    Rust wiring are unchanged by that switch).
+  - `src/main.rs`: the property is initialized at startup from the same
+    resolved value that initializes the UI SpinBox and the worker
+    (`resolve_startup_cps(load_cps())`), so it always matches the rate the
+    worker starts with; `on_cps_changed` updates it from the same clamped value
+    sent to the worker and saved (direct property set — the callback runs on
+    the UI thread, so no event-loop hop is needed).
+  - `screenshots/screenshot.png`: regenerated for the final inline layout
+    (captured from the release binary with the then-stored CPS value of 150,
+    so the CPS row reads `150 (6.7 ms)`).
+  - `SPEC.md` / `README.md`: the UI list and the one-paragraph description now
+    mention the target-interval display.
+- Calculation/formatting decision: the parenthetical is the *nominal*
+  interval, never presented as a measurement — Windows scheduling and the
+  target application's input handling determine the observed rate (already
+  documented in SPEC "Click rate"; the SPEC/README copy spells out the
+  target-vs-actual distinction, since the inline label is just the number
+  with its "ms" unit). Precision: one decimal place, the only amount that
+  distinguishes neighbouring CPS values anywhere in 1–500 (167 CPS ->
+  `6 ms` rather than a misleading `6.0 ms`/`6.1 ms`; 3 CPS -> `333.3 ms`;
+  160 CPS -> the exact half, `6.25`, rounds to `6.3 ms`; 166 CPS -> `6.02..`
+  rounds to `6 ms`). Whole-millisecond results (1, 2, 4, 5, 10, 20, 25, 50,
+  100, 200, 250, 500 CPS and the rounding cases) omit the decimal point. The
+  longest value the parenthetical can take is `(333.3 ms)` at low CPS, where
+  the value field is also widest; it is 12px against 16 digits and clears the
+  left-aligned value text at every CPS in 1–500 (verified by the range test
+  and the UIA pass).
+- Tests (all pure; no mouse input, no hotkeys): 3 new unit tests in
+  `src/clicker.rs` — exact display values incl. the edge and half-rounding
+  cases; out-of-range CPS clamps to the range-end display; and a whole-range
+  loop over 1..=500 comparing the display against an independently computed
+  round-half-up of the true `1000/CPS` value (f64 reference — the only exact
+  halves are exactly representable, and no other value sits close enough to a
+  rounding boundary at cps <= 500 for double error to matter).
+- Checks (all pass, 2026-10-08): `cargo fmt --check`,
+  `cargo check --all-targets`, `cargo test` (42 lib unit + 4 integration),
+  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`.
+- UI-level verification against the release binary (UIA, throwaway script
+  under `%TEMP%`), both layout iterations: (1) separate row — the displayed
+  interval at startup matched the persisted CPS (stored 150 -> `6.7 ms`);
+  a UIA value-set of the SpinBox to 3 updated it to `333.3 ms` and to 500 to
+  `2 ms`. (2) Inline (final) layout — the parenthetical text appears in the
+  same row as the spinner (UIA tree shows ` (6.7 ms)` directly after the
+  Spinner at startup with the stored 150) and tracks the SpinBox value
+  through the app's own `cps-changed` path: set 3 -> ` (333.3 ms) `, set 500
+  -> ` (2 ms) `; the separate row is gone from the tree; the window still
+  closes cleanly via UIA `WindowPattern.Close()` (exit code 0). The user's
+  stored `Cps` value was backed up before and restored after each run.
+- Limitations: the `PostMessage(WM_CLOSE)` the throwaway capture script
+  sends does not reliably reach this window (two of its runs needed a forced
+  kill); UIA `WindowPattern.Close()` works and is the supported close path
+  (Milestone 5 and the final-layout check both got exit code 0 through it).
+  The inline text is a display of the value the worker already knew — no
+  click, scheduling, or hotkey code path changed. The overlay geometry
+  (68px from the right edge) is computed from the fluent SpinBox's internal
+  paddings/chevron sizes; a Slint version bump that restyles the SpinBox
+  would need the offset rechecked (the value text is left-aligned and at
+  most 3 digits, so there is slack on both sides).
+
 ## Status
 
 Milestones 1–7 complete on the working branch: SPEC.md v1 scope (window,
@@ -466,5 +547,7 @@ and verified — end-to-end for hotkey behaviour (Milestone 5) and for CPS
 persistence via the UIA matrix above. The click scheduler runs the wake-based
 backend (waitable timer + command-event wake, QPC `Instant` deadline clock):
 full 100 CPS in the in-process wake probe (100.0 wake/s) and a bounded 500
-CPS (2 ms) wake probe. The branch is uncommitted; nothing here changes the
-click or hotkey code paths beyond the range widening.
+CPS (2 ms) wake probe. Milestone 9 added the target-interval display
+(`1000/CPS` ms, one decimal, labeled nominal). All branch work is
+uncommitted, per instruction; nothing in the click or hotkey code paths
+changed.

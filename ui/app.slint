@@ -13,6 +13,9 @@ export component MainWindow inherits Window {
     in property <[string]> hotkey-model;
     in-out property <int> hotkey-index: 0;
     in-out property <int> cps: 10;
+    // The nominal interval per click (1000 / CPS) in milliseconds, kept in
+    // sync by Rust from the same validated CPS value the worker uses.
+    in property <string> target-interval: "100 ms";
 
     callback toggle-clicking();
     callback cps-changed(value: int);
@@ -60,14 +63,34 @@ export component MainWindow inherits Window {
                 text: "Clicks per second";
                 vertical-alignment: center;
             }
-            SpinBox {
+            // Composite: the SpinBox fills an otherwise-transparent Rectangle,
+            // and the nominal target interval is drawn beside the value inside
+            // the same control. The SpinBox internals (fluent style) are
+            // `padding-left 12px | left-aligned value | chevrons 28px x 2 +
+            // 4px spacing | padding-right 2px`, so the value text occupies the
+            // left of the control and the right strip inside the border is
+            // free; the parenthetical is anchored there, right of the value
+            // and 6px clear of the chevrons. A plain Text takes no focus and
+            // catches no input, so editing and the SpinBox's keyboard/button
+            // handling are unaffected.
+            Rectangle {
                 horizontal-stretch: 1;
-                minimum: 1;
-                maximum: 500;
-                step-size: 1;
-                value <=> cps;
-                edited(value) => {
-                    cps-changed(value);
+                SpinBox {
+                    width: 100%;
+                    height: 100%;
+                    minimum: 1;
+                    maximum: 500;
+                    step-size: 1;
+                    value <=> cps;
+                    edited(value) => {
+                        cps-changed(value);
+                    }
+                }
+                Text {
+                    x: parent.width - 68px - self.width;
+                    vertical-alignment: center;
+                    text: " (" + target-interval + ")";
+                    font-size: 12px;
                 }
             }
         }
