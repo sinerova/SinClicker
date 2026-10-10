@@ -259,12 +259,22 @@ pub fn load_hotkey_display() -> Option<String> {
             return None;
         }
         // `size` is the byte count of the UTF-16 value (including its
-        // terminator). Decode up to the first NUL.
-        let wide_len = (size as usize).min(buf.len()).div_ceil(2);
-        let wide: &[u16] =
-            unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u16, wide_len) };
-        let s = String::from_utf16_lossy(wide);
-        let s = s.split('\0').next()?.to_owned();
+        // terminator). Decode up to the first NUL. REG_SZ is a sequence of
+        // little-endian code-unit bytes, so each code unit is read from its
+        // own stack slot: this forms no pointer into the middle of the buffer
+        // (a `&[u16]` over a byte allocation would be misaligned whenever the
+        // payload does not start on a 2-byte boundary) and tolerates an
+        // odd-length payload by ignoring its final byte.
+        let mut s = String::new();
+        let mut i = 0usize;
+        while i + 1 < buf.len() {
+            let unit = u16::from_le_bytes([buf[i], buf[i + 1]]);
+            if unit == 0 {
+                break;
+            }
+            s.push(char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER));
+            i += 2;
+        }
         if s.is_empty() {
             None
         } else {

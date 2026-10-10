@@ -538,16 +538,95 @@ clean when the branch was created.
   would need the offset rechecked (the value text is left-aligned and at
   most 3 digits, so there is slack on both sides).
 
+## Milestone 10 — done (senior-level audit + conservative optimization)
+
+Branch `maintenance/senior-audit` from `main` @ `cf82807` (the released
+production state: `v1.0.2.1` + the target-interval display, i.e. all of
+SPEC.md v1 scope plus hotkey customization, CPS 1–500 persistence, and the
+inline target-interval display are merged). `main` was clean when the branch
+was cut; no tags or other branches were touched.
+
+- Audit scope: CPS bounds/default/persistence and the inline interval display;
+  scheduler timing, idle CPU, command responsiveness, late-wake behavior,
+  shutdown; hotkey registration/customization/persistence/conflict handling/
+  thread ownership/unregistration; `SendInput` partial-failure handling and
+  error honesty; Windows API usage, unsafe boundaries and their comments,
+  handle/event ownership, races, cleanup; Slint UI clarity and separation;
+  module structure, naming, duplication, allocations, dependencies; build
+  config, release subsystem, docs.
+- Verified against the code (not assumed): every `windows` 0.62.2 signature
+  used in the crate was checked in the checked-out registry sources; the
+  six enabled `windows` features are all load-bearing (e.g.
+  `Win32_Security` is required by the 0.62.2 `CreateEventW`/timer
+  signatures); no unused dependency; no per-cycle heap allocation in the
+  click path; all unsafe blocks carry co-located SAFETY comments; kernel
+  handles (scheduler timer/event, hotkey events) each have exactly one close
+  site; the hotkey thread is joined before the worker and its events are
+  closed only after the join, so no hotkey message can reach the worker
+  during teardown.
+- Fixed (one defect):
+  - `src/settings.rs` `load_hotkey_display`: the stored REG_SZ payload was
+    decoded with `core::slice::from_raw_parts(buf.as_ptr() as *const u16, ..)`
+    — a `&[u16]` formed over a `Vec<u8>`. The buffer is not guaranteed 2-byte
+    aligned (a misaligned pointer is UB even when the length is zero), and a
+    `&[u16]` requires the base pointer to be `u16`-aligned for the full
+    lifetime. The SAFETY comment claimed the alignment guarantee the code
+    could not provide. Replaced with an obviously-safe per-code-unit
+    little-endian decode (each unit read into its own `u16` from the byte
+    buffer; decoding stops at the first NUL code unit, matching the old
+    behavior; odd-length payloads ignore the final trailing byte; lone
+    surrogate units become U+FFFD exactly as `from_utf16_lossy` did). This
+    is the hotkey-persistence read path used at startup and on selection
+    restore; the stored format, the fallback-to-default behavior, and every
+    other function in the file are unchanged, and no click/hotkey/scheduler
+    code path was touched.
+- Intentionally unchanged (sound as-is): the pure `ClickScheduler` deadline
+  math (drift-free anchored rolling deadline, at most one catch-up click,
+  CPS change within one new interval), the `WakeSource` strategy ladder and
+  its bound/`WAIT_EVENT` handling, the worker's drain-after-every-wake
+  invariant, `EventHandle`/`CommandEvent` ownership (`unsafe impl Send` is
+  justified by single-owner lifetime), `SendInput`'s partial-failure release
+  (best-effort, `GetLastError` captured before the release, success never
+  claimed), the hotkey register-new-then-retire-old flow and same-binding
+  no-op fast-path, the registry write paths (fresh, aligned `WideString`
+  buffers; `KEY_SET_VALUE` rights; per-value `RegCreateKeyExW`), the UI
+  (all spec'd elements present, nominal interval honestly labeled, no theme
+  polling, default fluent style), and the release configuration
+  (`windows_subsystem = "windows"` in release, `[profile.release] strip`).
+- Unresolved / maintainer decision (not changed):
+  - `SinClicker` is tracked as a gitlink (mode 160000) with no
+    `.gitmodules` entry — a nested clone of the same repository that was
+    committed by mistake (documented as pre-existing in Milestone 7).
+    `git clone` leaves it as an empty directory. Removing it is a history
+    decision (e.g. `git rm --cached SinClicker` as its own reviewed commit),
+    not an audit change; it was left exactly as found.
+  - `target/` is gitignored and untracked (the `target` directory visible in
+    the working tree holds only build artifacts). No action needed.
+- Validation (all run on this branch, 2026-10-10): `cargo fmt --check`
+  pass; `cargo check --all-targets` pass; `cargo test` — 42 lib unit +
+  4 integration pass (incl. the 100 CPS and 500 CPS wake probes);
+  `cargo clippy --all-targets -- -D warnings` pass (clean, no warnings);
+  `cargo build --release` pass. Release PE subsystem verified from the built
+  binary's headers: `SUBSYSTEM:02 = GUI` (Windows GUI, no console), machine
+  x64. No check required a skipped manual test: the launch/click/hotkey
+  behaviors that the Milestone-5 UIA harness covers were not re-run here
+  (they send real input), but the only code touched is the hotkey
+  *read* path, whose behavior is unchanged for any stored value the app
+  itself writes (ASCII REG_SZ, always correctly aligned in the new decode,
+  which returns the identical string).
+- Not run (deliberate, consistent with earlier milestones): the Milestone-5
+  UIA harness (real clicks/hotkey presses); UIPI into an elevated target;
+  live light/dark re-toggle.
+
 ## Status
 
-Milestones 1–7 complete on the working branch: SPEC.md v1 scope (window,
-clicker, global hotkey) plus supported-list hotkey customization with
-persistence, and the CPS range 1–500 with CPS persistence, are implemented
-and verified — end-to-end for hotkey behaviour (Milestone 5) and for CPS
-persistence via the UIA matrix above. The click scheduler runs the wake-based
+All of SPEC.md v1 scope is merged on `main` (released as `v1.0.2.1` +
+target-interval): window, clicker (CPS 1–500 with persistence), global
+hotkey with supported-list customization and persistence, and the inline
+nominal target-interval display. The click scheduler runs the wake-based
 backend (waitable timer + command-event wake, QPC `Instant` deadline clock):
 full 100 CPS in the in-process wake probe (100.0 wake/s) and a bounded 500
-CPS (2 ms) wake probe. Milestone 9 added the target-interval display
-(`1000/CPS` ms, one decimal, labeled nominal). All branch work is
-uncommitted, per instruction; nothing in the click or hotkey code paths
-changed.
+CPS (2 ms) wake probe. Milestone 10 was a senior-level audit of `main`; it
+found and fixed one unsafe-boundary defect in the hotkey read path
+(misaligned UTF-16 slice) and confirmed everything else unchanged. Its
+branch is uncommitted, per instruction.
