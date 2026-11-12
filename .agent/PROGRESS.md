@@ -618,6 +618,44 @@ was cut; no tags or other branches were touched.
   UIA harness (real clicks/hotkey presses); UIPI into an elevated target;
   live light/dark re-toggle.
 
+## Milestone 11 — done (dependency review + update, audit 2026-11-12)
+
+Branch `maintenance/dependency-review` from `main` @ `ae0fd3d` (clean tree at
+branch time; single worktree; no tags touched). Focused maintenance: dependency
+review only, no production code changes.
+
+- Baseline: direct deps already at latest stable — `slint 1.18.1`,
+  `slint-build 1.18.1` (build-dep), `windows 0.62.2` (features
+  `Win32_Foundation`, `Win32_UI_Input_KeyboardAndMouse`,
+  `Win32_UI_WindowsAndMessaging`, `Win32_System_Threading`,
+  `Win32_System_Registry`, `Win32_Security`). Verified against the crates.io
+  API (max_stable per crate) and the yank list (no yanked version in the tree;
+  yanked `windows` releases are 0.15–0.61, not locked). `Cargo.toml` unchanged.
+- Updated: `cargo update` (the full compatible patch/minor set, 561 crates
+  scanned; e.g. `icu_* 2.3.0→2.4.0`, `wgpu* 30.0.1→30.0.2`,
+  `tokio 1.53.2→1.54.1`, `zerocopy 0.8.59→0.8.63`,
+  `cc 1.6.0→1.11.1`; dedupe of duplicate `objc2`/`windows-sys`/
+  `windows-targets` plumbing). Only `Cargo.lock` changed
+  (+299/−344 lines; all changed versions are compatible minor/patch); no
+  direct-dependency version moved.
+- Vulnerability check: `cargo audit v0.23.0` (installed for this task, with the
+  maintainer's approval), freshly fetched RustSec advisory DB (1490 advisories,
+  2026-11-12), network available. Result: **0 confirmed vulnerabilities**.
+  6 "unmaintained" warnings, all transitive, all "no fixed upgrade available":
+  `pin-utils 0.1.1` (via `spin_on` → `slint-build`/`slint-macros`,
+  build-time only), `ttf-parser 0.25.1` (via `fontique` → `slint-build`,
+  build-time only), and `bincode 2.0.1`, `zbus_names 4.3.5`, `zvariant 5.15.1`,
+  `zvariant_derive 5.15.1` (slint's Linux D-Bus stack — not compiled for the
+  x86_64-pc-windows-msvc target per `cargo tree -i`). No runtime exposure on
+  the supported Windows x64 target; nothing suppressed or dismissed.
+- Validation (all pass, 2026-11-12, x86_64-pc-windows-msvc host = the supported
+  target): `cargo fmt --check`, `cargo check --all-targets`, `cargo test`
+  (42 lib unit + 4 integration, incl. the 100/500 CPS wake probes),
+  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`,
+  `cargo audit`. No production code touched, so the Milestone-5 UIA harness
+  (real clicks/hotkeys) was not re-run — consistent with earlier milestones.
+- Not committed (per instruction).
+
 ## Status
 
 All of SPEC.md v1 scope is merged on `main` (released as `v1.0.2.1` +
