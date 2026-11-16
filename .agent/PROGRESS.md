@@ -656,6 +656,23 @@ review only, no production code changes.
   (real clicks/hotkeys) was not re-run — consistent with earlier milestones.
 - Not committed (per instruction).
 
+## Milestone 12 - done (production-readiness audit, 2026-11-15)
+
+Branch `maintenance/production-readiness` from `main` @ `b08934b` (clean tree).
+
+- Fixed: a failed `SendInput` click ended the worker thread (`break`). The UI
+  showed the error and Stopped, but every later Start/hotkey press was silently
+  ignored until the app was restarted (e.g. after a transient refusal such as a
+  secure desktop/locked screen). The worker now stops clicking, reports the
+  error, and stays alive so a later Start works. The click sender is injected
+  into `worker_loop` (production passes `left_mouse_down_up`), with a mocked
+  regression test (`a_failed_click_stops_clicking_but_the_worker_accepts_a_later_start`);
+  no real input is sent. A wait failure in the wake backend still ends the worker.
+- Doc fix: `hotkey::EventHandle::new` comment said manual-reset; the event is auto-reset.
+- Re-reviewed, unchanged: CPS bounds/persistence, scheduler math, wake backend,
+  hotkey lifecycle/shutdown order, unsafe boundaries, registry code, release GUI subsystem.
+- Checks: see session report; the Milestone-5 UIA harness (real clicks) was not re-run.
+
 ## Status
 
 All of SPEC.md v1 scope is merged on `main` (released as `v1.0.2.1` +

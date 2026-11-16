@@ -10,7 +10,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::win_input::left_mouse_down_up;
+use crate::win_input::{left_mouse_down_up, WindowsError};
 use crate::win_scheduler::{CommandEvent, Wake, WakeSource, IDLE_WAIT_MICROS};
 
 pub const MIN_CPS: i32 = 1;
@@ -158,7 +158,7 @@ impl Worker {
         };
         let thread = std::thread::Builder::new()
             .name("sinclicker-worker".to_owned())
-            .spawn(move || worker_loop(source, rx, report, default_cps))
+            .spawn(move || worker_loop(source, rx, report, default_cps, left_mouse_down_up))
             .expect("failed to spawn the click-scheduler worker thread");
         Worker { handle, thread }
     }
@@ -194,6 +194,7 @@ fn worker_loop(
     command_rx: Receiver<Command>,
     report: impl Fn(WorkerEvent),
     default_cps: i32,
+    mut send_click: impl FnMut() -> Result<(), WindowsError>,
 ) {
     let mut scheduler = ClickScheduler::new(default_cps);
     let mut running = false;
@@ -203,11 +204,14 @@ fn worker_loop(
         let wait = scheduler.wait_us(running, now);
         if wait == 0 {
             // A click is due now (this is only reachable while running).
-            if let Err(error) = left_mouse_down_up() {
-                // Never report a failed click: surface the failure through the
-                // UI and end the worker (no further clicks are sent).
+            if let Err(error) = send_click() {
+                // Never report a failed click: stop clicking and surface the
+                // failure. The worker stays alive so a later Start works once
+                // input is accepted again, instead of being silently ignored.
+                running = false;
+                scheduler.stop();
                 report(WorkerEvent::Error(error.message));
-                break;
+                continue;
             }
             scheduler.advance(now);
             continue;
@@ -687,5 +691,73 @@ mod tests {
             "deadline {deadline} drifted from ideal {ideal}"
         );
         assert!(last_click_t < ideal + 10_000);
+    }
+
+    #[test]
+    fn a_failed_click_stops_clicking_but_the_worker_accepts_a_later_start() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let source = WakeSource::new();
+        let event = source.command_event();
+        let (tx, rx) = channel();
+        let handle = WorkerHandle {
+            tx,
+            command_event: event,
+        };
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls = Arc::new(AtomicU32::new(0));
+        let thread = {
+            let events = events.clone();
+            let calls = calls.clone();
+            std::thread::spawn(move || {
+                worker_loop(
+                    source,
+                    rx,
+                    move |e| events.lock().unwrap().push(format!("{e:?}")),
+                    1,
+                    // Mock sender: the first click fails, later ones succeed.
+                    // No real input is ever sent.
+                    move || {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(WindowsError {
+                                code: 5,
+                                message: "mock failure".to_owned(),
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            })
+        };
+        let wait_for = |needle: &str, count: usize| {
+            for _ in 0..200 {
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.contains(needle))
+                    .count()
+                    >= count
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "timed out waiting for {needle}: {:?}",
+                events.lock().unwrap()
+            );
+        };
+        handle.start();
+        wait_for("Error", 1);
+        // Still alive: a second Start is honoured (first click is immediate).
+        handle.start();
+        wait_for("Started", 2);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        handle.stop();
+        handle.quit();
+        thread.join().unwrap();
     }
 }
