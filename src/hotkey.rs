@@ -49,7 +49,7 @@ pub struct EventHandle(HANDLE);
 unsafe impl Send for EventHandle {}
 
 impl EventHandle {
-    /// Creates a manually-reset, initially-clear, anonymous event. Panics
+    /// Creates an auto-reset, initially-clear, anonymous event. Panics
     /// when the event cannot be created (an allocation failure of a kernel
     /// object is not recoverable here).
     fn new() -> Self {
