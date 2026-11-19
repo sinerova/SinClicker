@@ -1,9 +1,27 @@
-import { Button, ComboBox, HorizontalBox, SpinBox, VerticalBox } from "std-widgets.slint";
+import { Button, ComboBox, Palette, SpinBox } from "std-widgets.slint";
+
+// Small shared visual language. Neutral colors come from the Slint Palette so
+// the window follows the system light/dark setting; only the two status
+// colors are custom, each defined once per color scheme.
+global Ui {
+    out property <length> pad: 20px;
+    out property <length> gap: 16px;
+    out property <length> control-height: 36px;
+    out property <length> label-width: 112px;
+    out property <length> radius: 6px;
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> running: dark ? #6ccb5f : #107c10;
+    out property <color> error: dark ? #ff99a4 : #c42b1c;
+    out property <color> muted: Palette.foreground.with-alpha(0.7);
+}
 
 export component MainWindow inherits Window {
     title: "SinClicker";
-    preferred-width: 360px;
-    preferred-height: 310px;
+    preferred-width: 400px;
+    preferred-height: 264px;
+    min-width: 360px;
+    min-height: 264px;
+    background: Palette.background;
 
     in property <bool> running: false;
     in property <string> input-error: "";
@@ -21,92 +39,149 @@ export component MainWindow inherits Window {
     callback cps-changed(value: int);
     callback hotkey-changed(display: string);
 
-    VerticalBox {
-        padding: 16px;
-        spacing: 12px;
+    VerticalLayout {
+        padding: Ui.pad;
+        spacing: Ui.gap;
+        alignment: start;
 
-        Text {
-            text: "SinClicker";
-            font-size: 20px;
-            font-weight: FontWeight.semi-bold;
-        }
-
-        Text {
-            text: "Auto left-clicks at the current pointer position.";
-            wrap: word-wrap;
-        }
-
-        Text {
-            text: running ? "Clicking" : "Stopped";
-            font-size: 14px;
-            font-weight: FontWeight.semi-bold;
-        }
-
-        Text {
-            visible: input-error != "";
-            text: input-error;
-            wrap: word-wrap;
-            font-size: 12px;
+        // Header: identity on the left, live state on the right.
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text {
+                    text: "SinClicker";
+                    font-size: 22px;
+                    font-weight: FontWeight.semi-bold;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: "Auto left-clicks at the current pointer position.";
+                    wrap: word-wrap;
+                    font-size: 12px;
+                    color: Ui.muted;
+                }
+            }
+            Rectangle {
+                width: status-row.preferred-width + 20px;
+                height: 26px;
+                y: 4px;
+                border-radius: self.height / 2;
+                border-width: 1px;
+                border-color: running ? Ui.running : Palette.border;
+                background: running ? Ui.running.with-alpha(0.14) : transparent;
+                status-row := HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 6px;
+                    alignment: center;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 4px;
+                        background: running ? Ui.running : Ui.muted;
+                    }
+                    Text {
+                        text: running ? "Clicking" : "Stopped";
+                        font-size: 12px;
+                        font-weight: FontWeight.semi-bold;
+                        vertical-alignment: center;
+                        color: Palette.foreground;
+                    }
+                }
+            }
         }
 
         Button {
             text: running ? "Stop" : "Start";
-            height: 36px;
+            primary: !running;
+            height: 40px;
             clicked => {
                 toggle-clicking();
             }
         }
 
-        HorizontalBox {
-            spacing: 8px;
-            Text {
-                text: "Clicks per second";
-                vertical-alignment: center;
-            }
-            // Composite: the SpinBox fills an otherwise-transparent Rectangle,
-            // and the nominal target interval is drawn beside the value inside
-            // the same control. The SpinBox internals (fluent style) are
-            // `padding-left 12px | left-aligned value | chevrons 28px x 2 +
-            // 4px spacing | padding-right 2px`, so the value text occupies the
-            // left of the control and the right strip inside the border is
-            // free; the parenthetical is anchored there, right of the value
-            // and 6px clear of the chevrons. A plain Text takes no focus and
-            // catches no input, so editing and the SpinBox's keyboard/button
-            // handling are unaffected.
-            Rectangle {
-                horizontal-stretch: 1;
-                SpinBox {
-                    width: 100%;
-                    height: 100%;
-                    minimum: 1;
-                    maximum: 500;
-                    step-size: 1;
-                    value <=> cps;
-                    edited(value) => {
-                        cps-changed(value);
-                    }
-                }
+        if input-error != "": Rectangle {
+            border-radius: Ui.radius;
+            border-width: 1px;
+            border-color: Ui.error;
+            background: Ui.error.with-alpha(0.12);
+            VerticalLayout {
+                padding: 8px;
+                padding-left: 12px;
+                padding-right: 12px;
                 Text {
-                    x: parent.width - 68px - self.width;
-                    vertical-alignment: center;
-                    text: " (" + target-interval + ")";
+                    text: input-error;
+                    wrap: word-wrap;
                     font-size: 12px;
+                    color: Palette.foreground;
                 }
             }
         }
 
-        HorizontalBox {
-            spacing: 8px;
-            Text {
-                text: "Toggle hotkey";
-                vertical-alignment: center;
+        VerticalLayout {
+            spacing: 12px;
+
+            HorizontalLayout {
+                spacing: 12px;
+                height: Ui.control-height;
+                Text {
+                    width: Ui.label-width;
+                    text: "Clicks per second";
+                    vertical-alignment: center;
+                    color: Palette.foreground;
+                }
+                // Composite: the SpinBox fills an otherwise-transparent Rectangle,
+                // and the nominal target interval is drawn beside the value inside
+                // the same control. The SpinBox internals (fluent style) are
+                // `padding-left 12px | left-aligned value | chevrons 28px x 2 +
+                // 4px spacing | padding-right 2px`, so the value text occupies the
+                // left of the control and the right strip inside the border is
+                // free; the parenthetical is anchored there, right of the value
+                // and 6px clear of the chevrons. A plain Text takes no focus and
+                // catches no input, so editing and the SpinBox's keyboard/button
+                // handling are unaffected.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    SpinBox {
+                        width: 100%;
+                        height: 100%;
+                        minimum: 1;
+                        maximum: 500;
+                        step-size: 1;
+                        value <=> cps;
+                        edited(value) => {
+                            cps-changed(value);
+                        }
+                    }
+                    Text {
+                        x: parent.width - 68px - self.width;
+                        vertical-alignment: center;
+                        text: "(" + target-interval + ")";
+                        font-size: 12px;
+                        color: Ui.muted;
+                    }
+                }
             }
-            ComboBox {
-                horizontal-stretch: 1;
-                model: hotkey-model;
-                current-index <=> hotkey-index;
-                selected(display) => {
-                    hotkey-changed(display);
+
+            HorizontalLayout {
+                spacing: 12px;
+                height: Ui.control-height;
+                Text {
+                    width: Ui.label-width;
+                    text: "Toggle hotkey";
+                    vertical-alignment: center;
+                    color: Palette.foreground;
+                }
+                ComboBox {
+                    horizontal-stretch: 1;
+                    model: hotkey-model;
+                    current-index <=> hotkey-index;
+                    selected(display) => {
+                        hotkey-changed(display);
+                    }
                 }
             }
         }
