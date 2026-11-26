@@ -1,10 +1,47 @@
-use windows::Win32::Foundation::GetLastError;
+//! Simulated mouse input (`SendInput`) and the pointer check that keeps
+//! clicks out of SinClicker's own window.
+
+use windows::Win32::Foundation::{GetLastError, POINT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
+    MOUSE_EVENT_FLAGS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetWindowThreadProcessId, WindowFromPoint,
 };
 
 /// Number of input events one left-click down/up pair sends.
 const CLICK_EVENT_COUNT: u32 = 2;
+
+/// Returns `true` when the mouse pointer is over a window that belongs to this
+/// process.
+///
+/// A click sent there would press SinClicker's own controls: right after the
+/// Start button is clicked with the mouse, the first simulated click would
+/// land on that same button (now "Stop") and switch clicking straight off
+/// again, and a pointer resting on the CPS arrows would change the rate. The
+/// worker skips clicks while this holds. If the position cannot be read (for
+/// example while the secure desktop is shown), this returns `false` and the
+/// click is attempted, so `SendInput` reports any failure as usual.
+pub fn pointer_is_over_own_window() -> bool {
+    let mut point = POINT::default();
+    if unsafe {
+        // SAFETY: writes the cursor position into a local `POINT`.
+        GetCursorPos(&mut point)
+    }
+    .is_err()
+    {
+        return false;
+    }
+    let mut process_id = 0u32;
+    unsafe {
+        // SAFETY: plain queries. `WindowFromPoint` returns a null window when
+        // nothing is there, for which `GetWindowThreadProcessId` leaves the
+        // local `process_id` at 0.
+        GetWindowThreadProcessId(WindowFromPoint(point), Some(&mut process_id));
+    }
+    process_id == std::process::id()
+}
 
 /// Sends one left-button press (down + up) at the current pointer position.
 ///
@@ -83,7 +120,7 @@ fn format_failure(sent: u32, released: bool, code: u32) -> String {
     )
 }
 
-fn mouse_input(flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS) -> INPUT {
+fn mouse_input(flags: MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {

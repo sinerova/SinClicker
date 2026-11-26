@@ -42,18 +42,21 @@
 //! early click — a stale extra wake is harmless, a lost command is not, and the
 //! drain closes that gap.
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use windows::core::PWSTR;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateWaitableTimerExW, CreateWaitableTimerW, SetEvent, SetWaitableTimer,
-    WaitForMultipleObjects, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+    CreateWaitableTimerExW, CreateWaitableTimerW, SetWaitableTimer, WaitForMultipleObjects,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
+
+use crate::win_event::Event;
 
 /// 100-nanosecond units in one microsecond (a Windows 100-ns tick; 1 µs = 10
 /// ticks). Converts a microsecond delay into a `SetWaitableTimer` due time.
-pub const HUNDRED_NANOS_PER_MICROSECOND: i64 = 10;
+const HUNDRED_NANOS_PER_MICROSECOND: i64 = 10;
 
 /// Upper bound, in microseconds, on any single wait. Nothing may block longer
 /// than this; it guarantees the worker re-checks its state and can shut down
@@ -70,44 +73,6 @@ pub const IDLE_WAIT_MICROS: u64 = 2_000_000;
 /// reached (the 100-nanosecond unit truncation of the bound makes the actual
 /// bound at least `delay + 1` µs, so the timer always precedes the bound).
 const TIMER_SLACK_MICROS: u64 = 1_000;
-
-/// A kernel event handle that may be copied. It is a kernel object with no
-/// thread affinity. The owning [`WakeSource`] is the single close site (its
-/// `Drop`); copies held by the worker handle are never closed and are only
-/// signalled while the worker is alive, so no double-close occurs.
-#[derive(Clone, Copy)]
-pub struct CommandEvent(HANDLE);
-
-// SAFETY: the event is a kernel object with no thread affinity (any thread may
-// signal or wait on it). It is closed exactly once, in `WakeSource::Drop`,
-// after the worker thread (its only waiter) has ended.
-unsafe impl Send for CommandEvent {}
-
-impl CommandEvent {
-    /// Creates an auto-reset, initially-clear, anonymous event. Panics when the
-    /// event cannot be created (an allocation failure of a kernel object is not
-    /// recoverable here).
-    fn new() -> Self {
-        let event = unsafe {
-            // SAFETY: null attributes and a null name create a plain,
-            // non-inheritable, anonymous, auto-reset event usable from any
-            // thread.
-            CreateEventW(None, false, false, PWSTR::null())
-        }
-        .unwrap_or_else(|error| panic!("failed to create a click-scheduler event: {error:?}"));
-        CommandEvent(event)
-    }
-
-    /// Signals the event, waking a worker blocked in [`WakeSource::wait_for`].
-    /// Ignored if the event was already closed (the worker is shutting down).
-    pub fn signal(&self) {
-        let _ = unsafe {
-            // SAFETY: `SetEvent` only affects the kernel event this handle
-            // refers to.
-            SetEvent(self.0)
-        };
-    }
-}
 
 /// Why a wait returned control to the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,20 +131,17 @@ impl TimerKind {
 /// whether a click fires, so no wake — command signal, timer, or timeout — can
 /// cause an early click.
 pub struct WakeSource {
-    command_event: CommandEvent,
+    command_event: Arc<Event>,
     timer: Option<HANDLE>,
     kind: TimerKind,
     /// Epoch of the monotonic deadline clock (see [`Self::now_micros`]).
     epoch: Instant,
 }
 
-// SAFETY: every field is either already `Send` (`CommandEvent` above,
-// `TimerKind`) or a kernel object with no thread affinity (`HANDLE`). The
-// owning instance is created on the UI thread and moved into the worker thread
-// (`Worker::spawn`), where it lives for the thread's whole lifetime: the worker
-// is the only thread that calls `wait_for`/`now_micros` or drops it, and no
-// other thread touches the handles concurrently. So moving it across threads
-// never creates a data race.
+// SAFETY: the only non-`Send` field is the timer `HANDLE`, a kernel object
+// with no thread affinity. The instance is created on the UI thread and moved
+// into the worker thread (`Worker::spawn`), which is then the only thread that
+// arms, waits on, or closes the timer.
 unsafe impl Send for WakeSource {}
 
 impl WakeSource {
@@ -223,17 +185,16 @@ impl WakeSource {
         }
 
         WakeSource {
-            command_event: CommandEvent::new(),
+            command_event: Arc::new(Event::new()),
             timer,
             kind,
             epoch: Instant::now(),
         }
     }
 
-    /// The command event handle, for the worker handle to signal it. The copy
-    /// is never closed (the source's `Drop` is the single close site).
-    pub fn command_event(&self) -> CommandEvent {
-        self.command_event
+    /// The command event, for the worker handle to signal it.
+    pub fn command_event(&self) -> Arc<Event> {
+        Arc::clone(&self.command_event)
     }
 
     /// The wait strategy in use, for diagnostics.
@@ -262,13 +223,13 @@ impl WakeSource {
                     return Wake::Failed(error);
                 }
                 (
-                    &[timer, self.command_event.0],
+                    &[timer, self.command_event.raw()],
                     delay_micros.saturating_add(TIMER_SLACK_MICROS),
                 )
             }
             TimerKind::EventOnly => {
                 // No timer: the bounded wait's timeout is the deadline.
-                (&[self.command_event.0], delay_micros)
+                (&[self.command_event.raw()], delay_micros)
             }
         };
         // Millisecond precision is all `WaitForMultipleObjects` offers; the
@@ -277,9 +238,8 @@ impl WakeSource {
         let bound_ms = (bound_micros / 1000).clamp(1, MAX_WAIT_MICROS / 1000) as u32;
         let status = unsafe {
             // SAFETY: every handle is a live kernel object for the whole wait
-            // (the event and any timer are closed only in `Drop`, at the end of
-            // the worker thread); the slice stays valid for the duration of the
-            // call.
+            // (`self` owns the timer and holds a reference to the event); the
+            // slice stays valid for the duration of the call.
             WaitForMultipleObjects(handles, false, bound_ms)
         }
         .0;
@@ -351,16 +311,11 @@ impl Drop for WakeSource {
             let _ = unsafe {
                 // SAFETY: the timer is owned by this object; this is the sole
                 // close site and runs when the worker thread (its only user)
-                // ends.
+                // ends. The command event closes itself when its last `Arc`
+                // is dropped.
                 CloseHandle(timer)
             };
         }
-        let _ = unsafe {
-            // SAFETY: the command event is owned by this object; this is the
-            // sole close site. A worker-handle copy is never closed and is only
-            // signalled while this object is alive.
-            CloseHandle(self.command_event.0)
-        };
     }
 }
 
@@ -375,7 +330,7 @@ fn create_high_resolution_timer() -> Result<HANDLE, String> {
         // lets this process set and close it.
         CreateWaitableTimerExW(
             None,
-            PWSTR::null(),
+            PCWSTR::null(),
             CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
             TIMER_ALL_ACCESS.0,
         )
@@ -389,7 +344,7 @@ fn create_standard_timer() -> Result<HANDLE, String> {
         // SAFETY: null attributes and a null name; the timer is auto-reset and
         // re-armed one-shot on every cycle, so the reset behaviour does not
         // lose a deadline (the wait bound always covers it).
-        CreateWaitableTimerW(None, false, PWSTR::null())
+        CreateWaitableTimerW(None, false, PCWSTR::null())
     }
     .map_err(|error| format!("CreateWaitableTimerW: {error:?}"))
 }

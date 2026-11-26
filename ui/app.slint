@@ -31,6 +31,10 @@ export component MainWindow inherits Window {
     in property <[string]> hotkey-model;
     in-out property <int> hotkey-index: 0;
     in-out property <int> cps: 10;
+    // The supported range, set from `clicker::MIN_CPS`/`MAX_CPS` so the UI and
+    // the Rust-side clamp share one definition.
+    in property <int> min-cps: 1;
+    in property <int> max-cps: 500;
     // The nominal interval per click (1000 / CPS) in milliseconds, kept in
     // sync by Rust from the same validated CPS value the worker uses.
     in property <string> target-interval: "100 ms";
@@ -148,8 +152,8 @@ export component MainWindow inherits Window {
                     SpinBox {
                         width: 100%;
                         height: 100%;
-                        minimum: 1;
-                        maximum: 500;
+                        minimum: min-cps;
+                        maximum: max-cps;
                         step-size: 1;
                         value <=> cps;
                         edited(value) => {

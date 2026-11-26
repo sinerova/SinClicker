@@ -685,3 +685,28 @@ CPS (2 ms) wake probe. Milestone 10 was a senior-level audit of `main`; it
 found and fixed one unsafe-boundary defect in the hotkey read path
 (misaligned UTF-16 slice) and confirmed everything else unchanged. Its
 branch is uncommitted, per instruction.
+
+## Audit (2026-11-26) — branch `maintenance/audit-fixes`
+
+- Fixed: clicks are skipped while the pointer is over SinClicker's own window
+  (`win_input::pointer_is_over_own_window`). Before, starting with the mouse
+  made the first simulated click land on the Start/Stop button and toggle
+  clicking straight back off; a pointer on the CPS arrows changed the rate.
+  Earlier verification used UIA Invoke, which never exposed this.
+- Fixed: removed Ctrl+Alt+Delete from the catalog (the secure attention
+  sequence never reaches an app hotkey). A stored value falls back to the default.
+- Fixed: hotkey ids now cycle within `1..=0xBFFF` (the old global counter
+  could leave the range) and are owned by the hotkey thread.
+- Fixed: a successful hotkey change now clears a stale error banner.
+- Refactor: one owned `win_event::Event` (`Arc`, closes on `Drop`) replaces
+  the two hand-closed copyable event wrappers; `ClickScheduler` is the single
+  source of truth for running state; registry I/O uses `RegGetValueW` /
+  `RegSetKeyValueW`; catalog uses `windows` crate `MOD_*`/`VK_*` constants;
+  removed unused `parse_display`/`format_display`/`click_interval`; UI-thread
+  callbacks no longer hop through `invoke_from_event_loop`; CPS range is
+  passed to the UI from Rust.
+- Checks: `cargo clippy --all-targets -- -D warnings`, `cargo test`,
+  `cargo build --release` pass; release binary launches and closes with exit 0.
+- Slint now builds with the software renderer only (default-features off):
+  release working set ~74 MB -> ~22 MB, private memory ~80 MB -> ~4.5 MB.
+- Not verified by hand: real mouse Start with the pointer over the window.
