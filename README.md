@@ -3,7 +3,9 @@
 A small Windows-only autoclicker. It sends left mouse button clicks at
 the current pointer position at an adjustable rate (1–500 clicks per
 second). Clicking is started and stopped from the window, and a global
-hotkey (default Ctrl+Alt+F6) toggles clicking from anywhere. The window
+hotkey (default Ctrl+Alt+F6) toggles clicking from anywhere. To change the
+hotkey, click the hotkey field and press a new combination (Esc cancels);
+keys other than F1–F24 need Ctrl or Alt. The window
 also shows the target interval between clicks (1000/CPS milliseconds)
 beside the click-rate control; it is the nominal target, not a
 measurement of actual click timing. Clicks are skipped while the pointer

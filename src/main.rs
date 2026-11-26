@@ -2,13 +2,20 @@
 // `cargo run` logs stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use slint::{SharedString, VecModel};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+};
 
 use sinclicker::clicker::{
     target_interval_display, validate_cps, Worker, WorkerEvent, MAX_CPS, MIN_CPS,
 };
 use sinclicker::hotkey::{Hotkey, HotkeyEvent};
-use sinclicker::settings::{self, HotkeyChoice, SUPPORTED_HOTKEYS};
+use sinclicker::settings::{self, HotkeyChoice};
+use sinclicker::win_hotkey::vk_from_key_text;
 
 slint::include_modules!();
 
@@ -23,11 +30,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let window = MainWindow::new()?;
     let weak = window.as_weak();
 
-    // The ComboBox model is the catalog itself, in catalog order, so a UI
-    // index and a catalog index are the same thing.
-    let model: Vec<SharedString> = SUPPORTED_HOTKEYS.iter().map(|c| c.display.into()).collect();
-    window.set_hotkey_model(VecModel::from_slice(&model));
-    select_hotkey(&window, initial_hotkey);
+    show_hotkey(&window, initial_hotkey);
     window.set_min_cps(MIN_CPS);
     window.set_max_cps(MAX_CPS);
     // Plain property sets do not fire the SpinBox's `edited` callback, so no
@@ -51,12 +54,22 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Mirrors the UI's `hotkey-recording` for the hotkey thread. While a new
+    // shortcut is being recorded, pressing the *current* one never reaches the
+    // window (Windows delivers it as the global hotkey instead), so it ends
+    // recording, keeping that binding, rather than toggling clicking.
+    let recording = Arc::new(AtomicBool::new(false));
+
     let hotkey = Hotkey::spawn(initial_hotkey, {
         let weak = weak.clone();
         let worker = worker.handle().clone();
+        let recording = Arc::clone(&recording);
         // Runs on the hotkey thread. A press is routed through the worker so
         // the worker stays the single authority on the running state.
         move |event| match event {
+            HotkeyEvent::Activated if recording.load(Ordering::Acquire) => {
+                let _ = weak.upgrade_in_event_loop(|window| window.set_hotkey_recording(false));
+            }
             HotkeyEvent::Activated => worker.toggle(),
             HotkeyEvent::RegistrationFailed(message) => {
                 let log_message = message.clone();
@@ -95,32 +108,52 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    window.on_hotkey_changed({
+    window.on_hotkey_recording_changed({
+        let recording = Arc::clone(&recording);
+        move |value| recording.store(value, Ordering::Release)
+    });
+
+    window.on_hotkey_captured({
         let weak = weak.clone();
         let hotkey = hotkey.handle();
-        move |display| {
+        move |text, ctrl, alt, shift, meta| {
             let Some(window) = weak.upgrade() else { return };
-            // The model is the catalog, so this only fails if they drift apart.
-            let Some(choice) = settings::choice_for_display(&display) else {
-                return;
+            let modifiers = [(ctrl, MOD_CONTROL), (alt, MOD_ALT), (shift, MOD_SHIFT)]
+                .into_iter()
+                .filter(|(held, _)| *held)
+                .fold(HOT_KEY_MODIFIERS(0), |all, (_, m)| all | m);
+            let choice = vk_from_key_text(&text)
+                .ok_or_else(|| "That key can't be used for the hotkey.".to_owned())
+                .and_then(|vk| HotkeyChoice::new(modifiers, vk, meta));
+            let choice = match choice {
+                Ok(choice) => choice,
+                Err(problem) => {
+                    // Not a usable binding: say why and keep recording so the
+                    // user can try another combination.
+                    window.set_hotkey_problem(problem.into());
+                    return;
+                }
             };
+            window.set_hotkey_recording(false);
             match hotkey.set_binding(choice) {
                 Ok(()) => {
-                    // The new binding is active: clear any earlier hotkey
-                    // error, then persist it (a failed save is only reported).
-                    let error = match settings::save_hotkey_display(choice.display) {
+                    // The new binding is active: show it, clear any earlier
+                    // hotkey error, then persist it (a failed save is only
+                    // reported).
+                    show_hotkey(&window, choice);
+                    let error = match settings::save_hotkey_display(&choice.display()) {
                         Ok(()) => String::new(),
                         Err(error) => format!("The hotkey could not be saved: {error}"),
                     };
                     window.set_input_error(error.into());
                 }
                 Err(report) => {
-                    // The previous binding (if any) is still the active one;
-                    // put the selection back on it so the UI does not claim a
-                    // binding that is not registered.
+                    // The previous binding (if any) is still the active one,
+                    // and the field still shows it; report why the new one
+                    // could not be registered.
                     window.set_input_error(report.message.into());
                     if let Some(active) = report.active {
-                        select_hotkey(&window, active);
+                        show_hotkey(&window, active);
                     }
                 }
             }
@@ -138,9 +171,9 @@ fn main() -> Result<(), slint::PlatformError> {
     run_result
 }
 
-/// Points the ComboBox at `choice`.
-fn select_hotkey(window: &MainWindow, choice: HotkeyChoice) {
-    if let Some(index) = SUPPORTED_HOTKEYS.iter().position(|c| *c == choice) {
-        window.set_hotkey_index(index as i32);
-    }
+/// Shows `choice` in the shortcut field.
+fn show_hotkey(window: &MainWindow, choice: HotkeyChoice) {
+    let keys: Vec<SharedString> = choice.parts().into_iter().map(Into::into).collect();
+    window.set_hotkey_keys(VecModel::from_slice(&keys));
+    window.set_hotkey_display(choice.display().into());
 }

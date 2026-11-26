@@ -1,4 +1,4 @@
-import { Button, ComboBox, Palette, SpinBox } from "std-widgets.slint";
+import { Button, Palette, SpinBox } from "std-widgets.slint";
 
 // Small shared visual language. Neutral colors come from the Slint Palette so
 // the window follows the system light/dark setting; only the two status
@@ -15,6 +15,113 @@ global Ui {
     out property <color> muted: Palette.foreground.with-alpha(0.7);
 }
 
+// One key of a shortcut, drawn as a small keycap.
+component KeyCap inherits Rectangle {
+    in property <string> text;
+    width: max(24px, label.preferred-width + 14px);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Palette.border;
+    background: Palette.alternate-background;
+    label := Text {
+        text: root.text;
+        font-size: 12px;
+        font-weight: FontWeight.semi-bold;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: Palette.foreground;
+    }
+}
+
+// Shows the current shortcut as keycaps; click it (or focus it and press
+// Space/Enter) to record a new one. While recording, every key press is
+// forwarded through `captured` except bare modifiers (still being held) and a
+// plain Escape (cancels). Losing focus also cancels. Validation and
+// registration happen in Rust, which ends recording on success.
+component ShortcutField {
+    in property <[string]> keys;
+    in property <string> display;
+    in-out property <bool> recording;
+    callback captured(text: string, ctrl: bool, alt: bool, shift: bool, meta: bool);
+
+    forward-focus: scope;
+    accessible-role: button;
+    accessible-label: "Toggle hotkey";
+    accessible-description: recording ? "Press a new shortcut, or Escape to cancel" : display;
+    accessible-action-default => {
+        scope.focus();
+        root.recording = true;
+    }
+
+    Rectangle {
+        border-radius: Ui.radius;
+        border-width: root.recording || scope.has-focus ? 2px : 1px;
+        border-color: root.recording || scope.has-focus ? Palette.accent-background : Palette.border;
+        background: touch.has-hover && !root.recording ? Palette.alternate-background : Palette.control-background;
+    }
+
+    scope := FocusScope {
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                scope.focus();
+                root.recording = true;
+            }
+        }
+
+        changed has-focus => {
+            if !self.has-focus {
+                root.recording = false;
+            }
+        }
+        key-pressed(event) => {
+            if !root.recording {
+                if event.text == Key.Space || event.text == Key.Return {
+                    root.recording = true;
+                    return accept;
+                }
+                return reject;
+            }
+            if event.repeat {
+                return accept;
+            }
+            if event.text == Key.Escape && !event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift && !event.modifiers.meta {
+                root.recording = false;
+                return accept;
+            }
+            if event.text == Key.Shift || event.text == Key.ShiftR || event.text == Key.Control || event.text == Key.ControlR || event.text == Key.Alt || event.text == Key.AltGr || event.text == Key.Meta || event.text == Key.MetaR || event.text == Key.CapsLock {
+                return accept;
+            }
+            root.captured(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta);
+            accept
+        }
+    }
+
+    HorizontalLayout {
+        padding: 6px;
+        padding-left: 8px;
+        padding-right: 12px;
+        spacing: 4px;
+        for key in root.recording ? [] : root.keys: KeyCap {
+            text: key;
+        }
+        if root.recording: Text {
+            text: "Press a shortcut…";
+            vertical-alignment: center;
+            color: Ui.muted;
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.recording ? "Esc to cancel" : "Change";
+            font-size: 12px;
+            vertical-alignment: center;
+            color: Ui.muted;
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "SinClicker";
     preferred-width: 400px;
@@ -25,11 +132,14 @@ export component MainWindow inherits Window {
 
     in property <bool> running: false;
     in property <string> input-error: "";
-    // Populated from the Rust catalog (`settings::SUPPORTED_HOTKEYS`) before
-    // the event loop starts, so the ComboBox order and the Rust index
-    // mapping can never drift apart.
-    in property <[string]> hotkey-model;
-    in-out property <int> hotkey-index: 0;
+    // The active binding, set by Rust from the registered `HotkeyChoice`:
+    // its parts (shown as keycaps) and its full display string.
+    in property <[string]> hotkey-keys: ["Ctrl", "Alt", "F6"];
+    in property <string> hotkey-display: "Ctrl+Alt+F6";
+    // True while the shortcut field is waiting for a new combination.
+    in-out property <bool> hotkey-recording: false;
+    // Why the last captured combination was refused; shown while recording.
+    in-out property <string> hotkey-problem: "";
     in-out property <int> cps: 10;
     // The supported range, set from `clicker::MIN_CPS`/`MAX_CPS` so the UI and
     // the Rust-side clamp share one definition.
@@ -41,7 +151,13 @@ export component MainWindow inherits Window {
 
     callback toggle-clicking();
     callback cps-changed(value: int);
-    callback hotkey-changed(display: string);
+    callback hotkey-captured(text: string, ctrl: bool, alt: bool, shift: bool, meta: bool);
+    callback hotkey-recording-changed(recording: bool);
+
+    changed hotkey-recording => {
+        hotkey-problem = "";
+        hotkey-recording-changed(hotkey-recording);
+    }
 
     VerticalLayout {
         padding: Ui.pad;
@@ -170,21 +286,35 @@ export component MainWindow inherits Window {
                 }
             }
 
-            HorizontalLayout {
-                spacing: 12px;
-                height: Ui.control-height;
-                Text {
-                    width: Ui.label-width;
-                    text: "Toggle hotkey";
-                    vertical-alignment: center;
-                    color: Palette.foreground;
+            VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 12px;
+                    height: Ui.control-height;
+                    Text {
+                        width: Ui.label-width;
+                        text: "Toggle hotkey";
+                        vertical-alignment: center;
+                        color: Palette.foreground;
+                    }
+                    ShortcutField {
+                        horizontal-stretch: 1;
+                        keys: hotkey-keys;
+                        display: hotkey-display;
+                        recording <=> hotkey-recording;
+                        captured(text, ctrl, alt, shift, meta) => {
+                            hotkey-captured(text, ctrl, alt, shift, meta);
+                        }
+                    }
                 }
-                ComboBox {
-                    horizontal-stretch: 1;
-                    model: hotkey-model;
-                    current-index <=> hotkey-index;
-                    selected(display) => {
-                        hotkey-changed(display);
+                // Guidance while recording, aligned under the field.
+                if hotkey-recording: HorizontalLayout {
+                    padding-left: Ui.label-width + 12px;
+                    Text {
+                        text: hotkey-problem != "" ? hotkey-problem : "Hold Ctrl or Alt and press a key.";
+                        wrap: word-wrap;
+                        font-size: 12px;
+                        color: hotkey-problem != "" ? Ui.error : Ui.muted;
                     }
                 }
             }
