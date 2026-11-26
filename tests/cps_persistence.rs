@@ -5,7 +5,7 @@
 //! drop-guard restores the user's prior value (type + bytes) or removes it.
 //!
 //! Wrong-typed entries (REG_SZ/REG_QWORD) and malformed values are exercised
-//! against the built application via UIA (see PROGRESS.md), not here: the
+//! against the built application via UIA (see docs/HISTORY.md), not here: the
 //! type check inside `load_cps` is internal and such values cannot be
 //! produced through the public API.
 

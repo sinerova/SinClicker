@@ -43,10 +43,10 @@ same. The hotkey should work while the app window is not focused.
 
 Use a fixed initial hotkey of **Ctrl+Alt+F6**. Show it in the interface. If it
 is already registered by another application, report that clearly and do not
-start clicking. The user may switch to another binding from a supported list of
-Ctrl+Alt combinations; only those supported bindings can ever be registered,
-and arbitrary combinations are not accepted. The chosen binding persists
-across launches.
+start clicking. The user may record a custom binding in the hotkey field. Keys
+other than F1–F24 need Ctrl or Alt; F12, Windows-key combinations,
+Ctrl+Alt+Delete, Escape and Tab are refused with a short reason. The chosen
+binding persists across launches.
 
 Do not add a system-tray icon, startup-on-login, profiles, click-location
 selection, or multiple mouse buttons in this version. The settings that are
@@ -83,7 +83,7 @@ Clicks should happen at the current pointer position; do not move the pointer.
 
 ## Global hotkey and threading
 
-Register Ctrl+Alt+F6 using the Windows global-hotkey API.
+Register the binding (default Ctrl+Alt+F6) using the Windows global-hotkey API.
 
 Use a dedicated background thread for the hotkey message loop. Do not block the
 Slint UI thread waiting for hotkey messages. Send hotkey events and registration
@@ -132,27 +132,9 @@ make such a change only if it builds correctly and measured results justify it.
 A release profile may favor a smaller binary, but do not describe binary-size
 settings as guaranteed runtime or memory optimizations.
 
-## Suggested project layout
+## Project layout
 
-The implementation may choose a slightly different layout if there is a
-concrete reason.
-
-    Cargo.toml
-    Cargo.lock
-    build.rs
-    ui/
-      app.slint
-    src/
-      main.rs
-      app.rs
-      clicker.rs
-      hotkey.rs
-      win_input.rs
-    tests/
-      rate_validation.rs
-    README.md
-
-Keep Windows API calls and `unsafe` code localized. Add comments describing
+The current module map is in `AGENTS.md` at the repository root. Keep Windows API calls and `unsafe` code localized. Add comments describing
 safety assumptions around each unsafe block.
 
 ## Windows input limitations
@@ -172,7 +154,6 @@ The app reports only what `SendInput` accepted; it never claims more.
 - Right-click, middle-click, or multi-button patterns.
 - Randomized intervals.
 - Macro recording or playback.
-- Hotkey rebinding outside the supported Ctrl+Alt list.
 - Tray mode or background service.
 - Installer, auto-updater, or auto-start.
 - Attempts to evade anti-cheat or application protections.

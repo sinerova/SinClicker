@@ -1,4 +1,8 @@
-# Progress
+# History
+
+Append-only milestone log, oldest first. Each entry records what changed, the
+checks that ran, and what was left unverified. Earlier "Status" sections
+describe the state at the time they were written.
 
 ## Milestone 1 — done (window scaffold)
 
@@ -710,3 +714,30 @@ branch is uncommitted, per instruction.
 - Slint now builds with the software renderer only (default-features off):
   release working set ~74 MB -> ~22 MB, private memory ~80 MB -> ~4.5 MB.
 - Not verified by hand: real mouse Start with the pointer over the window.
+
+## Custom hotkey (2026-11-26) — PR #11
+
+- The predefined hotkey list is replaced by a recorder: click the hotkey field
+  and press a combination. `settings::HotkeyChoice` is a validated
+  modifiers + virtual-key pair with canonical text (`Ctrl+Alt+F6`), so
+  bindings saved by earlier versions still parse. Keys other than F1–F24 need
+  Ctrl or Alt. F12, Windows-key combinations, Ctrl+Alt+Delete, Escape and Tab
+  are refused. `win_hotkey::vk_from_key_text` maps Slint key text to virtual
+  keys (`VkKeyScanW` for characters).
+- Pressing the current hotkey while recording ends recording instead of
+  toggling clicking.
+- Checks: fmt, clippy, `cargo test` (42 pass). Release build driven by hand:
+  record, refuse, register + persist, Esc, same-hotkey path.
+- Screenshot refreshed in the reorganization PR.
+
+## Repository reorganization (2026-11-26)
+
+- `.agent/AGENTS.md` (greenfield "build the app" prompt for OpenCode) is now
+  a root `AGENTS.md` maintenance guide: module map, validation commands,
+  invariants, known pitfalls. `CLAUDE.md` imports it, so Claude Code loads it
+  automatically.
+- `.agent/SPEC.md` -> `docs/SPEC.md`, updated for custom hotkeys, with its
+  stale layout section replaced by a pointer to `AGENTS.md`.
+  `.agent/PROGRESS.md` -> `docs/HISTORY.md`. `.agent/VALIDATION.md` was
+  merged into `AGENTS.md`.
+- No code changes.
