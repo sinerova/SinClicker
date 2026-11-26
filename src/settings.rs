@@ -1,40 +1,43 @@
-//! Settings: the supported hotkey catalog, display formatting/parsing, and
-//! persistence of the chosen binding and the CPS value.
+//! Settings: the supported hotkey catalog and persistence of the chosen
+//! binding and the CPS value in the per-user registry.
 //!
-//! Everything besides the registry I/O is pure and unit-tested; no test
+//! The catalog and startup resolution are pure and unit-tested; no test here
 //! registers a hotkey or sends input.
 
-/// `MOD_*` modifier bits, matching `RegisterHotKey` (without `MOD_NOREPEAT`,
-/// which is added at registration time).
-pub const MOD_CONTROL: u32 = 0x0002;
-pub const MOD_ALT: u32 = 0x0001;
-pub const MOD_SHIFT: u32 = 0x0004;
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::System::Registry::{
+    RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_ROUTINE_FLAGS, REG_SZ,
+    REG_VALUE_TYPE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_A, VK_BACK, VK_END, VK_F10,
+    VK_F11, VK_F13, VK_F14, VK_F15, VK_F16, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT,
+    VK_NEXT, VK_OEM_PERIOD, VK_PRIOR, VK_SPACE,
+};
 
-/// Virtual-key codes (verified against `windows::...::KeyboardAndMouse`).
-pub const VK_BACK: u32 = 0x08;
-pub const VK_SPACE: u32 = 0x20;
-pub const VK_END: u32 = 0x23;
-pub const VK_HOME: u32 = 0x24;
-pub const VK_PRIOR: u32 = 0x21; // Page Up
-pub const VK_NEXT: u32 = 0x22; // Page Down
-pub const VK_DELETE: u32 = 0x2E;
-pub const VK_INSERT: u32 = 0x2D;
-pub const VK_OEM_PERIOD: u32 = 0xBE; // left period / comma (en-US layout)
-pub const VK_A: u32 = 0x41;
-pub const VK_F1: u32 = 0x70;
+use crate::clicker::{DEFAULT_CPS, MAX_CPS, MIN_CPS};
 
 /// A supported toggle hotkey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyChoice {
-    /// Canonical display string, for example `Ctrl+Alt+F6`.
+    /// Canonical display string, for example `Ctrl+Alt+F6`. This is also the
+    /// persisted form.
     pub display: &'static str,
-    /// Modifiers for `RegisterHotKey` (without `MOD_NOREPEAT`).
-    pub modifiers: u32,
-    /// Virtual-key code.
-    pub vk: u32,
+    /// Modifiers for `RegisterHotKey` (without `MOD_NOREPEAT`, which is added
+    /// at registration time).
+    pub modifiers: HOT_KEY_MODIFIERS,
+    pub vk: VIRTUAL_KEY,
 }
 
-const fn choice(display: &'static str, modifiers: u32, vk: u32) -> HotkeyChoice {
+const CTRL_ALT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0);
+const CTRL_SHIFT_ALT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(CTRL_ALT.0 | MOD_SHIFT.0);
+
+const fn choice(
+    display: &'static str,
+    modifiers: HOT_KEY_MODIFIERS,
+    vk: VIRTUAL_KEY,
+) -> HotkeyChoice {
     HotkeyChoice {
         display,
         modifiers,
@@ -46,69 +49,39 @@ const fn choice(display: &'static str, modifiers: u32, vk: u32) -> HotkeyChoice 
 ///
 /// Every entry is Ctrl+Alt based: Ctrl is always present because Alt alone is
 /// reserved for menu/IME use, Shift may be added optionally, no Windows-key
-/// combination appears (those are reserved for the OS), and F12 is excluded
-/// (it is reserved for debuggers). This is the set `RegisterHotKey` can
-/// reliably own.
-pub const SUPPORTED_HOTKEYS: [HotkeyChoice; 23] = [
-    choice("Ctrl+Alt+F6", MOD_CONTROL | MOD_ALT, VK_F1 + 5),
-    choice("Ctrl+Alt+F7", MOD_CONTROL | MOD_ALT, VK_F1 + 6),
-    choice("Ctrl+Alt+F8", MOD_CONTROL | MOD_ALT, VK_F1 + 7),
-    choice("Ctrl+Alt+F9", MOD_CONTROL | MOD_ALT, VK_F1 + 8),
-    choice("Ctrl+Alt+F10", MOD_CONTROL | MOD_ALT, VK_F1 + 9),
-    choice("Ctrl+Alt+F11", MOD_CONTROL | MOD_ALT, VK_F1 + 10),
-    choice("Ctrl+Alt+F13", MOD_CONTROL | MOD_ALT, VK_F1 + 12),
-    choice("Ctrl+Alt+F14", MOD_CONTROL | MOD_ALT, VK_F1 + 13),
-    choice("Ctrl+Alt+F15", MOD_CONTROL | MOD_ALT, VK_F1 + 14),
-    choice("Ctrl+Alt+F16", MOD_CONTROL | MOD_ALT, VK_F1 + 15),
-    choice("Ctrl+Alt+Insert", MOD_CONTROL | MOD_ALT, VK_INSERT),
-    choice("Ctrl+Alt+Delete", MOD_CONTROL | MOD_ALT, VK_DELETE),
-    choice("Ctrl+Alt+Home", MOD_CONTROL | MOD_ALT, VK_HOME),
-    choice("Ctrl+Alt+End", MOD_CONTROL | MOD_ALT, VK_END),
-    choice("Ctrl+Alt+PageUp", MOD_CONTROL | MOD_ALT, VK_PRIOR),
-    choice("Ctrl+Alt+PageDown", MOD_CONTROL | MOD_ALT, VK_NEXT),
-    choice(
-        "Ctrl+Shift+Alt+F6",
-        MOD_CONTROL | MOD_ALT | MOD_SHIFT,
-        VK_F1 + 5,
-    ),
-    choice(
-        "Ctrl+Shift+Alt+F7",
-        MOD_CONTROL | MOD_ALT | MOD_SHIFT,
-        VK_F1 + 6,
-    ),
-    choice(
-        "Ctrl+Shift+Alt+F9",
-        MOD_CONTROL | MOD_ALT | MOD_SHIFT,
-        VK_F1 + 8,
-    ),
-    choice("Ctrl+Alt+Space", MOD_CONTROL | MOD_ALT, VK_SPACE),
-    choice("Ctrl+Alt+Backspace", MOD_CONTROL | MOD_ALT, VK_BACK),
-    choice("Ctrl+Alt+Period", MOD_CONTROL | MOD_ALT, VK_OEM_PERIOD),
-    choice("Ctrl+Alt+A", MOD_CONTROL | MOD_ALT, VK_A),
+/// combination appears (those are reserved for the OS), F12 is excluded (it is
+/// reserved for debuggers), and Ctrl+Alt+Delete is excluded (it is the secure
+/// attention sequence, which Windows handles before any application hotkey).
+pub const SUPPORTED_HOTKEYS: [HotkeyChoice; 22] = [
+    choice("Ctrl+Alt+F6", CTRL_ALT, VK_F6),
+    choice("Ctrl+Alt+F7", CTRL_ALT, VK_F7),
+    choice("Ctrl+Alt+F8", CTRL_ALT, VK_F8),
+    choice("Ctrl+Alt+F9", CTRL_ALT, VK_F9),
+    choice("Ctrl+Alt+F10", CTRL_ALT, VK_F10),
+    choice("Ctrl+Alt+F11", CTRL_ALT, VK_F11),
+    choice("Ctrl+Alt+F13", CTRL_ALT, VK_F13),
+    choice("Ctrl+Alt+F14", CTRL_ALT, VK_F14),
+    choice("Ctrl+Alt+F15", CTRL_ALT, VK_F15),
+    choice("Ctrl+Alt+F16", CTRL_ALT, VK_F16),
+    choice("Ctrl+Alt+Insert", CTRL_ALT, VK_INSERT),
+    choice("Ctrl+Alt+Home", CTRL_ALT, VK_HOME),
+    choice("Ctrl+Alt+End", CTRL_ALT, VK_END),
+    choice("Ctrl+Alt+PageUp", CTRL_ALT, VK_PRIOR),
+    choice("Ctrl+Alt+PageDown", CTRL_ALT, VK_NEXT),
+    choice("Ctrl+Shift+Alt+F6", CTRL_SHIFT_ALT, VK_F6),
+    choice("Ctrl+Shift+Alt+F7", CTRL_SHIFT_ALT, VK_F7),
+    choice("Ctrl+Shift+Alt+F9", CTRL_SHIFT_ALT, VK_F9),
+    choice("Ctrl+Alt+Space", CTRL_ALT, VK_SPACE),
+    choice("Ctrl+Alt+Backspace", CTRL_ALT, VK_BACK),
+    choice("Ctrl+Alt+Period", CTRL_ALT, VK_OEM_PERIOD),
+    choice("Ctrl+Alt+A", CTRL_ALT, VK_A),
 ];
 
-/// The default display string; also the first (index 0) UI choice.
-pub const DEFAULT_HOTKEY_DISPLAY: &str = "Ctrl+Alt+F6";
-
-/// Resolves a persisted CPS value to the CPS the application starts with: a
-/// stored value inside the supported range is used as-is; `None` (missing or
-/// unreadable storage) and any out-of-range number fall back to the default.
-/// Pure, so the out-of-range fallback is unit-tested without registry access.
-pub fn resolve_startup_cps(stored: Option<i32>) -> i32 {
-    use crate::clicker::{DEFAULT_CPS, MAX_CPS, MIN_CPS};
-    match stored {
-        Some(value) if (MIN_CPS..=MAX_CPS).contains(&value) => value,
-        None | Some(_) => DEFAULT_CPS,
-    }
-}
-
-/// Canonical display strings of all supported hotkeys, in UI order.
-pub fn supported_hotkey_displays() -> Vec<&'static str> {
-    SUPPORTED_HOTKEYS.iter().map(|h| h.display).collect()
-}
+/// The default binding; also the first UI choice.
+pub const DEFAULT_HOTKEY: HotkeyChoice = SUPPORTED_HOTKEYS[0];
 
 /// Resolves a display string (from the UI or from persisted storage) to a
-/// supported choice, or `None` when it is not a supported form.
+/// supported choice, or `None` when it is not one.
 pub fn choice_for_display(display: &str) -> Option<HotkeyChoice> {
     SUPPORTED_HOTKEYS
         .iter()
@@ -116,352 +89,123 @@ pub fn choice_for_display(display: &str) -> Option<HotkeyChoice> {
         .copied()
 }
 
-/// Parses a canonical display string such as `Ctrl+Alt+F6` into
-/// `(ctrl, alt, shift, key)`. Returns `None` when the string is not a
-/// supported display form: both Ctrl and Alt must be present, any other
-/// modifier token or malformed shape is rejected, and the key token must be a
-/// short alphanumeric run.
-pub fn parse_display(display: &str) -> Option<(bool, bool, bool, &str)> {
-    let parts: Vec<&str> = display.split('+').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let key = *parts.last()?;
-    if !is_valid_key(key) {
-        return None;
-    }
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut shift = false;
-    for part in &parts[..parts.len() - 1] {
-        match *part {
-            "Ctrl" => ctrl = true,
-            "Alt" => alt = true,
-            "Shift" => shift = true,
-            _ => return None,
-        }
-    }
-    if !(ctrl && alt) {
-        return None;
-    }
-    Some((ctrl, alt, shift, key))
+/// The binding to start with: the persisted one when it is still supported,
+/// otherwise the default.
+pub fn resolve_startup_hotkey(stored: Option<&str>) -> HotkeyChoice {
+    stored
+        .and_then(choice_for_display)
+        .unwrap_or(DEFAULT_HOTKEY)
 }
 
-/// A key token is valid when it is a short, non-empty alphanumeric run
-/// (e.g. `F6`, `PageUp`, `Period`).
-fn is_valid_key(key: &str) -> bool {
-    let bytes = key.as_bytes();
-    !bytes.is_empty() && bytes.len() <= 10 && bytes.iter().all(|b| b.is_ascii_alphanumeric())
+/// Resolves a persisted CPS value to the CPS the application starts with: a
+/// stored value inside the supported range is used as-is; `None` (missing or
+/// unreadable storage) and any out-of-range number fall back to the default.
+pub fn resolve_startup_cps(stored: Option<i32>) -> i32 {
+    match stored {
+        Some(value) if (MIN_CPS..=MAX_CPS).contains(&value) => value,
+        None | Some(_) => DEFAULT_CPS,
+    }
 }
 
-/// Formats a canonical display string from its parts, in `Ctrl+[Shift+]Alt+key`
-/// order — the same modifier order the catalog's display strings use.
-pub fn format_display(ctrl: bool, alt: bool, shift: bool, key: &str) -> String {
-    let mut s = String::new();
-    if ctrl {
-        s.push_str("Ctrl");
-    }
-    if shift {
-        s.push('+');
-        s.push_str("Shift");
-    }
-    if alt {
-        s.push('+');
-        s.push_str("Alt");
-    }
-    s.push('+');
-    s.push_str(key);
-    s
+// ---- Registry persistence (HKCU, so no elevation is required) -------------
+
+const SETTINGS_SUBKEY: PCWSTR = w!("Software\\SinClicker");
+const HOTKEY_VALUE: PCWSTR = w!("Hotkey");
+const CPS_VALUE: PCWSTR = w!("Cps");
+
+/// Longest display string accepted from the registry, in UTF-16 units
+/// (including the terminator). Every catalog entry is far shorter; anything
+/// longer is not a supported binding, so it is treated as unreadable.
+const MAX_STORED_DISPLAY_UNITS: usize = 64;
+
+/// Reads a value of the type `flags` allows into `buf`, returning the number
+/// of bytes written, or `None` when the key or value is missing, has another
+/// type, does not fit, or cannot be read.
+fn read_value(name: PCWSTR, flags: REG_ROUTINE_FLAGS, buf: &mut [u8]) -> Option<usize> {
+    let mut size = u32::try_from(buf.len()).ok()?;
+    let status = unsafe {
+        // SAFETY: both names are static NUL-terminated strings; `buf` is
+        // writable for `size` bytes and outlives the call; `RRF_RT_*` makes
+        // Windows reject any other value type instead of writing it.
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_SUBKEY,
+            name,
+            flags,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    (status == ERROR_SUCCESS).then_some(size as usize)
 }
 
-/// Registry location (per-user, so no elevation is required) of the persisted
-/// hotkey value.
-#[cfg(target_os = "windows")]
-pub const SETTINGS_SUBKEY: &str = "Software\\SinClicker";
-#[cfg(target_os = "windows")]
-const HOTKEY_VALUE: &str = "Hotkey";
-#[cfg(target_os = "windows")]
-const CPS_VALUE: &str = "Cps";
-
-/// A NUL-terminated UTF-16 string on a `Vec` that stays alive for a call.
-#[cfg(target_os = "windows")]
-struct WideString(Vec<u16>);
-
-#[cfg(target_os = "windows")]
-impl WideString {
-    fn new(s: &str) -> Self {
-        let mut v: Vec<u16> = s.encode_utf16().collect();
-        v.push(0);
-        WideString(v)
-    }
-    fn ptr(&mut self) -> windows::core::PWSTR {
-        windows::core::PWSTR(self.0.as_mut_ptr())
+/// Writes a value, creating the settings key when it does not exist yet.
+fn write_value(name: PCWSTR, kind: REG_VALUE_TYPE, data: &[u8]) -> Result<(), String> {
+    let len = u32::try_from(data.len()).map_err(|_| "value too large".to_owned())?;
+    let status = unsafe {
+        // SAFETY: both names are static NUL-terminated strings; `data` is
+        // readable for `len` bytes and outlives the call.
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_SUBKEY,
+            name,
+            kind.0,
+            Some(data.as_ptr().cast()),
+            len,
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("Windows error code {:#x}", status.0))
     }
 }
 
 /// Reads the persisted binding display string, or `None` when nothing usable
-/// is stored or reading fails (first launch, missing value, wrong type, or a
-/// registry error).
-#[cfg(target_os = "windows")]
+/// is stored (first launch, missing value, wrong type, or a registry error).
 pub fn load_hotkey_display() -> Option<String> {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ,
-        REG_VALUE_TYPE,
-    };
-
-    let mut subkey = WideString::new(SETTINGS_SUBKEY);
-    let mut value = WideString::new(HOTKEY_VALUE);
-    let mut hkey: HKEY = unsafe { core::mem::zeroed() };
-
-    // SAFETY: `RegOpenKeyExW` writes the opened key handle into `hkey`; the
-    // subkey is a live NUL-terminated UTF-16 string. `WIN32_ERROR(0)` means
-    // success.
-    if unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.ptr(),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-    }
-    .0 != 0
-    {
-        return None;
-    }
-
-    let result = (|| -> Option<String> {
-        let mut size: u32 = 0;
-        // SAFETY: a null data buffer with a size out-param asks only for the
-        // stored value's size.
-        if unsafe { RegQueryValueExW(hkey, value.ptr(), None, None, None, Some(&mut size)) }.0 != 0
-            || size == 0
-        {
-            return None;
-        }
-        let mut data_type: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
-        let mut buf = vec![0u8; size as usize];
-        // SAFETY: `buf` is exactly `size` bytes and outlives the query;
-        // `data_type` outlives the query too.
-        if unsafe {
-            RegQueryValueExW(
-                hkey,
-                value.ptr(),
-                None,
-                Some(&mut data_type),
-                Some(buf.as_mut_ptr()),
-                Some(&mut size),
-            )
-        }
-        .0 != 0
-            || data_type != REG_SZ
-        {
-            return None;
-        }
-        // `size` is the byte count of the UTF-16 value (including its
-        // terminator). Decode up to the first NUL. REG_SZ is a sequence of
-        // little-endian code-unit bytes, so each code unit is read from its
-        // own stack slot: this forms no pointer into the middle of the buffer
-        // (a `&[u16]` over a byte allocation would be misaligned whenever the
-        // payload does not start on a 2-byte boundary) and tolerates an
-        // odd-length payload by ignoring its final byte.
-        let mut s = String::new();
-        let mut i = 0usize;
-        while i + 1 < buf.len() {
-            let unit = u16::from_le_bytes([buf[i], buf[i + 1]]);
-            if unit == 0 {
-                break;
-            }
-            s.push(char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER));
-            i += 2;
-        }
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    })();
-
-    // SAFETY: `hkey` was opened above; this is its last use.
-    let _ = unsafe { RegCloseKey(hkey) };
-    result
+    let mut buf = [0u8; MAX_STORED_DISPLAY_UNITS * 2];
+    let len = read_value(HOTKEY_VALUE, RRF_RT_REG_SZ, &mut buf)?;
+    // `RegGetValueW` NUL-terminates REG_SZ data. Decode up to the terminator.
+    let units: Vec<u16> = buf[..len]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    String::from_utf16(&units).ok().filter(|s| !s.is_empty())
 }
 
-/// Persists the chosen binding display string. The returned error carries the
-/// failing Win32 code so the caller can surface it; the app keeps working
-/// either way.
-#[cfg(target_os = "windows")]
+/// Persists the chosen binding display string.
 pub fn save_hotkey_display(value: &str) -> Result<(), String> {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
-    };
-
-    let mut subkey = WideString::new(SETTINGS_SUBKEY);
-    let mut value_name = WideString::new(HOTKEY_VALUE);
     let data: Vec<u8> = value
         .encode_utf16()
-        .chain(core::iter::once(0u16))
-        .flat_map(|c| c.to_le_bytes())
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
         .collect();
-
-    let mut hkey: HKEY = unsafe { core::mem::zeroed() };
-    // SAFETY: `RegCreateKeyExW` writes the created/opened key into `hkey`; the
-    // subkey is a live NUL-terminated UTF-16 string; a null class name and
-    // null security attributes are acceptable per the Win32 contract.
-    // `WIN32_ERROR(0)` means success.
-    let create = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.ptr(),
-            Some(0),
-            windows::core::PCWSTR::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            None,
-            &mut hkey,
-            None,
-        )
-    };
-    if create.0 != 0 {
-        return Err(format!(
-            "could not open the settings key (Windows error code {:#x})",
-            create.0
-        ));
-    }
-
-    // SAFETY: `data` is NUL-terminated UTF-16 (REG_SZ) and outlives the call.
-    let set =
-        unsafe { RegSetValueExW(hkey, value_name.ptr(), None, REG_SZ, Some(data.as_slice())) };
-    // SAFETY: `hkey` was opened above; this is its last use.
-    let _ = unsafe { RegCloseKey(hkey) };
-    if set.0 != 0 {
-        return Err(format!(
-            "could not save the hotkey (Windows error code {:#x})",
-            set.0
-        ));
-    }
-    Ok(())
+    write_value(HOTKEY_VALUE, REG_SZ, &data)
 }
 
-/// Reads the persisted CPS value, or `None` when nothing usable is stored or
-/// reading fails (first launch, missing value, wrong type, wrong size, or a
-/// registry error). Range checking is the caller's job; this function does not
-/// trust the stored number to be in range.
-#[cfg(target_os = "windows")]
+/// Reads the persisted CPS value, or `None` when nothing usable is stored.
+/// Range checking is the caller's job ([`resolve_startup_cps`]).
 pub fn load_cps() -> Option<i32> {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
-        REG_VALUE_TYPE,
-    };
-
-    let mut subkey = WideString::new(SETTINGS_SUBKEY);
-    let mut value = WideString::new(CPS_VALUE);
-    let mut hkey: HKEY = unsafe { core::mem::zeroed() };
-
-    // SAFETY: `RegOpenKeyExW` writes the opened key handle into `hkey`; the
-    // subkey is a live NUL-terminated UTF-16 string. `WIN32_ERROR(0)` means
-    // success.
-    if unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.ptr(),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
+    let mut buf = [0u8; 4];
+    match read_value(CPS_VALUE, RRF_RT_REG_DWORD, &mut buf)? {
+        4 => Some(i32::from_le_bytes(buf)),
+        _ => None,
     }
-    .0 != 0
-    {
-        return None;
-    }
-
-    let result = (|| -> Option<i32> {
-        // SAFETY: a fixed 4-byte buffer with a size out-param queries the
-        // stored value; `data_type` outlives the query.
-        let mut data_type: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
-        let mut raw: [u8; 4] = [0; 4];
-        let mut size: u32 = 4;
-        let code = unsafe {
-            RegQueryValueExW(
-                hkey,
-                value.ptr(),
-                None,
-                Some(&mut data_type),
-                Some(raw.as_mut_ptr()),
-                Some(&mut size),
-            )
-        }
-        .0;
-        // A REG_DWORD holds exactly 4 bytes of payload; any other size or
-        // type is malformed and must fall back to the default.
-        if code != 0 || size != 4 || data_type != REG_DWORD {
-            return None;
-        }
-        Some(i32::from_le_bytes(raw))
-    })();
-
-    // SAFETY: `hkey` was opened above; this is its last use.
-    let _ = unsafe { RegCloseKey(hkey) };
-    result
 }
 
-/// Persists the CPS value as a REG_DWORD under the same per-user key as the
-/// hotkey. The returned error carries the failing Win32 code so the caller can
-/// surface it; the app keeps working either way.
-#[cfg(target_os = "windows")]
+/// Persists the CPS value as a REG_DWORD.
 pub fn save_cps(cps: i32) -> Result<(), String> {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-        REG_DWORD, REG_OPTION_NON_VOLATILE,
-    };
-
-    let mut subkey = WideString::new(SETTINGS_SUBKEY);
-    let mut value_name = WideString::new(CPS_VALUE);
-    let data: [u8; 4] = cps.to_le_bytes();
-
-    let mut hkey: HKEY = unsafe { core::mem::zeroed() };
-    // SAFETY: `RegCreateKeyExW` writes the created/opened key into `hkey`; the
-    // subkey is a live NUL-terminated UTF-16 string; a null class name and
-    // null security attributes are acceptable per the Win32 contract.
-    // `WIN32_ERROR(0)` means success.
-    let create = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.ptr(),
-            Some(0),
-            windows::core::PCWSTR::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            None,
-            &mut hkey,
-            None,
-        )
-    };
-    if create.0 != 0 {
-        return Err(format!(
-            "could not open the settings key (Windows error code {:#x})",
-            create.0
-        ));
-    }
-
-    // SAFETY: `data` is 4 bytes (the REG_DWORD payload) and outlives the call.
-    let set = unsafe { RegSetValueExW(hkey, value_name.ptr(), None, REG_DWORD, Some(&data)) };
-    // SAFETY: `hkey` was opened above; this is its last use.
-    let _ = unsafe { RegCloseKey(hkey) };
-    if set.0 != 0 {
-        return Err(format!(
-            "could not save the click rate (Windows error code {:#x})",
-            set.0
-        ));
-    }
-    Ok(())
+    write_value(CPS_VALUE, REG_DWORD, &cps.to_le_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clicker::{DEFAULT_CPS, MAX_CPS, MIN_CPS};
 
     #[test]
     fn resolve_startup_cps_uses_a_stored_in_range_value() {
@@ -483,26 +227,55 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_expected_size_and_order() {
-        let displays = supported_hotkey_displays();
-        assert_eq!(displays.len(), 23);
-        assert_eq!(displays.first().copied(), Some("Ctrl+Alt+F6"));
-        assert!(displays.contains(&"Ctrl+Shift+Alt+F6"));
-        assert!(displays.contains(&"Ctrl+Alt+A"));
-        // Reserved keys must never appear.
-        for d in &displays {
-            assert!(!d.contains("F12"), "F12 is reserved: {d}");
-            assert!(!d.contains("Win"), "Win combinations are OS-reserved: {d}");
+    fn resolve_startup_hotkey_falls_back_to_the_default() {
+        assert_eq!(resolve_startup_hotkey(None), DEFAULT_HOTKEY);
+        assert_eq!(
+            resolve_startup_hotkey(Some("Ctrl+Alt+F9")).display,
+            "Ctrl+Alt+F9"
+        );
+        // Unsupported or retired bindings fall back.
+        assert_eq!(
+            resolve_startup_hotkey(Some("Ctrl+Alt+Delete")),
+            DEFAULT_HOTKEY
+        );
+        assert_eq!(resolve_startup_hotkey(Some("garbage")), DEFAULT_HOTKEY);
+    }
+
+    #[test]
+    fn catalog_has_expected_default_and_excludes_reserved_keys() {
+        assert_eq!(DEFAULT_HOTKEY.display, "Ctrl+Alt+F6");
+        for h in SUPPORTED_HOTKEYS {
+            assert!(!h.display.contains("F12"), "F12 is reserved: {}", h.display);
+            assert!(
+                !h.display.contains("Win"),
+                "Win is OS-reserved: {}",
+                h.display
+            );
+            assert!(
+                !h.display.contains("Delete"),
+                "Ctrl+Alt+Delete is the SAS: {}",
+                h.display
+            );
+            assert!(
+                h.modifiers.0 & CTRL_ALT.0 == CTRL_ALT.0,
+                "every binding needs Ctrl+Alt: {}",
+                h.display
+            );
         }
     }
 
     #[test]
-    fn catalog_entries_are_unique_by_vk_and_modifiers() {
-        for a in SUPPORTED_HOTKEYS {
-            for b in SUPPORTED_HOTKEYS {
-                if (a.modifiers, a.vk) == (b.modifiers, b.vk) {
-                    assert_eq!(a.display, b.display);
-                }
+    fn catalog_entries_are_unique() {
+        for (i, a) in SUPPORTED_HOTKEYS.iter().enumerate() {
+            for b in &SUPPORTED_HOTKEYS[i + 1..] {
+                assert_ne!(a.display, b.display);
+                assert_ne!(
+                    (a.modifiers, a.vk),
+                    (b.modifiers, b.vk),
+                    "{} vs {}",
+                    a.display,
+                    b.display
+                );
             }
         }
     }
@@ -523,58 +296,5 @@ mod tests {
         assert_eq!(choice_for_display("Ctrl+Alt+Win+F6"), None);
         assert_eq!(choice_for_display(""), None);
         assert_eq!(choice_for_display("Ctrl+Alt+F6 "), None); // trailing space
-    }
-
-    #[test]
-    fn parse_display_accepts_supported_forms() {
-        assert_eq!(
-            parse_display("Ctrl+Alt+F6"),
-            Some((true, true, false, "F6"))
-        );
-        assert_eq!(
-            parse_display("Ctrl+Shift+Alt+F6"),
-            Some((true, true, true, "F6"))
-        );
-        assert_eq!(
-            parse_display("Ctrl+Alt+PageUp"),
-            Some((true, true, false, "PageUp"))
-        );
-        assert_eq!(parse_display("Ctrl+Alt+A"), Some((true, true, false, "A")));
-    }
-
-    #[test]
-    fn parse_display_rejects_unsupported_forms() {
-        for bad in [
-            "Ctrl+F6",                   // Alt missing
-            "Alt+F6",                    // Ctrl missing
-            "Win+F6",                    // unknown modifier
-            "Ctrl+Alt",                  // no key
-            "Ctrl+Alt+",                 // dangling empty key
-            "",                          // empty
-            "Ctrl++Alt+F6",              // empty middle token
-            "ctrl+Alt+F6",               // case is significant
-            "Ctrl+Alt+averylongkeyname", // key too long
-            "Ctrl+Alt+PageUp Up",        // space in key
-            "Ctrl+Alt+F-6",              // non-alphanumeric in key
-        ] {
-            assert_eq!(parse_display(bad), None, "for {bad:?}");
-        }
-    }
-
-    #[test]
-    fn format_display_is_canonical() {
-        assert_eq!(format_display(true, true, false, "F6"), "Ctrl+Alt+F6");
-        assert_eq!(format_display(true, true, true, "F7"), "Ctrl+Shift+Alt+F7");
-        assert_eq!(format_display(true, true, false, "A"), "Ctrl+Alt+A");
-    }
-
-    #[test]
-    fn catalog_displays_parse_and_reformat_to_themselves() {
-        for h in SUPPORTED_HOTKEYS {
-            let Some((c, a, s, k)) = parse_display(h.display) else {
-                panic!("does not parse: {}", h.display);
-            };
-            assert_eq!(format_display(c, a, s, k), h.display, "for {}", h.display);
-        }
     }
 }

@@ -7,11 +7,12 @@
 //! and is driven by the worker.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
-use crate::win_input::{left_mouse_down_up, WindowsError};
-use crate::win_scheduler::{CommandEvent, Wake, WakeSource, IDLE_WAIT_MICROS};
+use crate::win_event::Event;
+use crate::win_input::{left_mouse_down_up, pointer_is_over_own_window, WindowsError};
+use crate::win_scheduler::{Wake, WakeSource, IDLE_WAIT_MICROS};
 
 pub const MIN_CPS: i32 = 1;
 pub const MAX_CPS: i32 = 500;
@@ -26,16 +27,10 @@ pub fn validate_cps(cps: i32) -> i32 {
     cps.clamp(MIN_CPS, MAX_CPS)
 }
 
-/// Returns the time to wait between clicks for a CPS value that has been
-/// clamped (or is already in range) to 1..=500. A CPS of 1 waits 1 second;
-/// a CPS of 500 waits 2 milliseconds.
-pub fn click_interval(cps: i32) -> Duration {
-    Duration::from_secs_f64(1.0 / validate_cps(cps) as f64)
-}
-
-/// Microsecond interval between clicks for a CPS value (clamped into range).
-/// The pure deadline math works in whole microseconds, so `cps * interval`
-/// equals one second within integer rounding.
+/// Microsecond interval between clicks for a CPS value (clamped into range):
+/// 1 CPS waits 1 s, 500 CPS waits 2 ms. The deadline math works in whole
+/// microseconds, so `cps * interval` equals one second within integer
+/// rounding.
 pub fn click_interval_micros(cps: i32) -> u64 {
     1_000_000 / validate_cps(cps) as u64
 }
@@ -84,7 +79,7 @@ pub enum WorkerEvent {
 #[derive(Clone)]
 pub struct WorkerHandle {
     tx: Sender<Command>,
-    command_event: CommandEvent,
+    command_event: Arc<Event>,
 }
 
 impl WorkerHandle {
@@ -93,8 +88,7 @@ impl WorkerHandle {
             // The worker thread is gone (the application is shutting down).
             return;
         }
-        // Wake the worker promptly. Safe even if the event has just been
-        // closed (shut down): `signal` ignores the failure.
+        // Wake the worker promptly; the channel only carries the payload.
         self.command_event.signal();
     }
 
@@ -147,10 +141,8 @@ impl Worker {
     pub fn spawn(default_cps: i32, report: impl Fn(WorkerEvent) + Send + 'static) -> Worker {
         let (tx, rx) = channel();
         // The wake backend is created here (kernel objects have no thread
-        // affinity) and moved into the worker thread; its `Drop` on that
-        // thread is the single close site for the timer/event handles. The
-        // worker handle keeps only a copy of the command event, which it
-        // signals but never closes.
+        // affinity) and moved into the worker thread, which owns it from then
+        // on. The handle shares its command event to wake the worker.
         let source = WakeSource::new();
         let handle = WorkerHandle {
             tx,
@@ -158,7 +150,7 @@ impl Worker {
         };
         let thread = std::thread::Builder::new()
             .name("sinclicker-worker".to_owned())
-            .spawn(move || worker_loop(source, rx, report, default_cps, left_mouse_down_up))
+            .spawn(move || worker_loop(source, rx, report, default_cps, send_click))
             .expect("failed to spawn the click-scheduler worker thread");
         Worker { handle, thread }
     }
@@ -172,12 +164,21 @@ impl Worker {
     /// the application exits. Consuming `self` is intentional: the worker is
     /// never restarted.
     pub fn shutdown(self) {
-        self.handle.stop();
         self.handle.quit();
         if let Err(error) = self.thread.join() {
             eprintln!("failed to join the click worker thread: {error:?}");
         }
     }
+}
+
+/// The production click: one left click at the pointer, unless the pointer is
+/// over SinClicker's own window (see [`pointer_is_over_own_window`]), in which
+/// case the click is skipped and the schedule simply moves on.
+fn send_click() -> Result<(), WindowsError> {
+    if pointer_is_over_own_window() {
+        return Ok(());
+    }
+    left_mouse_down_up()
 }
 
 /// Runs on the worker thread: clicks at the current CPS when running and
@@ -197,18 +198,16 @@ fn worker_loop(
     mut send_click: impl FnMut() -> Result<(), WindowsError>,
 ) {
     let mut scheduler = ClickScheduler::new(default_cps);
-    let mut running = false;
 
     loop {
         let now = wake.now_micros();
-        let wait = scheduler.wait_us(running, now);
+        let wait = scheduler.wait_us(now);
         if wait == 0 {
             // A click is due now (this is only reachable while running).
             if let Err(error) = send_click() {
                 // Never report a failed click: stop clicking and surface the
                 // failure. The worker stays alive so a later Start works once
                 // input is accepted again, instead of being silently ignored.
-                running = false;
                 scheduler.stop();
                 report(WorkerEvent::Error(error.message));
                 continue;
@@ -231,13 +230,7 @@ fn worker_loop(
 
         // Service any commands this wake (timer or command signal). `Quit` ends
         // the loop; a `Stop` simply makes the next cycle take the idle wait.
-        if drain_commands(
-            &command_rx,
-            &mut running,
-            &mut scheduler,
-            wake.now_micros(),
-            &report,
-        ) {
+        if drain_commands(&command_rx, &mut scheduler, wake.now_micros(), &report) {
             break;
         }
     }
@@ -247,50 +240,36 @@ fn worker_loop(
 /// `Quit` was among them (the worker should exit), `false` otherwise.
 fn drain_commands(
     command_rx: &Receiver<Command>,
-    running: &mut bool,
     scheduler: &mut ClickScheduler,
     now: u64,
     report: &impl Fn(WorkerEvent),
 ) -> bool {
-    let mut quit = false;
     while let Ok(command) = command_rx.try_recv() {
-        match command {
-            Command::Start => {
-                if !*running {
-                    *running = true;
-                    scheduler.start(now);
-                    report(WorkerEvent::Started);
-                }
-            }
-            Command::Stop => {
-                if *running {
-                    *running = false;
-                    scheduler.stop();
-                    report(WorkerEvent::Stopped);
-                }
-            }
-            Command::Toggle => {
-                if *running {
-                    *running = false;
-                    scheduler.stop();
-                    report(WorkerEvent::Stopped);
-                } else {
-                    *running = true;
-                    scheduler.start(now);
-                    report(WorkerEvent::Started);
-                }
-            }
+        let run = match command {
+            Command::Start => true,
+            Command::Stop => false,
+            Command::Toggle => !scheduler.is_running(),
             Command::SetCps(value) => {
-                scheduler.set_cps(value, *running, now);
+                scheduler.set_cps(value, now);
+                continue;
             }
             Command::Quit => {
-                quit = true;
-                *running = false;
                 scheduler.stop();
+                return true;
+            }
+        };
+        // Starting while running (or stopping while stopped) is ignored.
+        if run != scheduler.is_running() {
+            if run {
+                scheduler.start(now);
+                report(WorkerEvent::Started);
+            } else {
+                scheduler.stop();
+                report(WorkerEvent::Stopped);
             }
         }
     }
-    quit
+    false
 }
 
 /// The pure, testable cadence core.
@@ -301,6 +280,8 @@ fn drain_commands(
 ///   burst of catch-up clicks,
 /// - a CPS change applies from the next click without a restart, moving a
 ///   pending deadline earlier when the new interval is shorter.
+///
+/// It is running exactly when a deadline is armed.
 #[derive(Debug, Clone)]
 pub struct ClickScheduler {
     interval_us: u64,
@@ -317,9 +298,9 @@ impl ClickScheduler {
         }
     }
 
-    /// The current interval between clicks, in microseconds.
-    pub fn interval_us(&self) -> u64 {
-        self.interval_us
+    /// Whether clicking is on.
+    pub fn is_running(&self) -> bool {
+        self.next_deadline_us.is_some()
     }
 
     /// The armed next-click deadline, in monotonic microseconds (`None` when
@@ -345,24 +326,19 @@ impl ClickScheduler {
     /// earlier than the deadline already armed, so a rate increase applies
     /// within one new interval; a rate decrease (or a change that would
     /// *delay* the next click) keeps the pending deadline and the new interval
-    /// then applies from [`advance`](Self::advance) onward.
-    pub fn set_cps(&mut self, cps: i32, running: bool, now: u64) {
+    /// then applies from [`advance`](Self::advance) onward. A lapsed deadline
+    /// is rescheduled one new interval from now (no burst, as in `advance`).
+    pub fn set_cps(&mut self, cps: i32, now: u64) {
         let interval = click_interval_micros(cps);
         self.interval_us = interval;
-        if !running {
-            self.next_deadline_us = None;
-            return;
+        if let Some(pending) = self.next_deadline_us.as_mut() {
+            let new_deadline = now.saturating_add(interval);
+            *pending = if now < *pending {
+                (*pending).min(new_deadline)
+            } else {
+                new_deadline
+            };
         }
-        let new_deadline = now.saturating_add(interval);
-        let pending = match self.next_deadline_us {
-            Some(d) if now < d => d.min(new_deadline),
-            // No deadline armed (defensive: running implies one is) or the
-            // pending deadline has already lapsed: schedule the next click one
-            // new interval from now, consistent with `advance`'s catch-up
-            // policy (no burst).
-            None | Some(_) => new_deadline,
-        };
-        self.next_deadline_us = Some(pending);
     }
 
     /// True when running and a click deadline has already arrived.
@@ -373,10 +349,7 @@ impl ClickScheduler {
     /// How long, in microseconds, to wait before the next click: `0` when a
     /// click is due immediately, the remaining time to the deadline otherwise,
     /// and the idle wait when not running.
-    pub fn wait_us(&self, running: bool, now: u64) -> u64 {
-        if !running {
-            return IDLE_WAIT_MICROS;
-        }
+    pub fn wait_us(&self, now: u64) -> u64 {
         match self.next_deadline_us {
             None => IDLE_WAIT_MICROS,
             Some(d) if now >= d => 0,
@@ -406,11 +379,11 @@ impl ClickScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn default_cps_is_ten() {
         assert_eq!(DEFAULT_CPS, 10);
-        assert_eq!(click_interval(DEFAULT_CPS), Duration::from_millis(100));
         assert_eq!(click_interval_micros(DEFAULT_CPS), 100_000);
     }
 
@@ -418,7 +391,6 @@ mod tests {
     fn cps_below_range_is_clamped_up() {
         assert_eq!(validate_cps(0), 1);
         assert_eq!(validate_cps(-7), 1);
-        assert_eq!(click_interval(0), Duration::from_secs(1));
         assert_eq!(click_interval_micros(0), 1_000_000);
     }
 
@@ -426,7 +398,6 @@ mod tests {
     fn cps_above_range_is_clamped_down() {
         assert_eq!(validate_cps(501), 500);
         assert_eq!(validate_cps(10_000), 500);
-        assert_eq!(click_interval(501), Duration::from_millis(2));
         assert_eq!(click_interval_micros(501), 2_000);
     }
 
@@ -435,15 +406,6 @@ mod tests {
         for cps in [1, 2, 10, 50, 99, 100, 250, 499, 500] {
             assert_eq!(validate_cps(cps), cps);
         }
-    }
-
-    #[test]
-    fn interval_matches_cps() {
-        assert_eq!(click_interval(1), Duration::from_secs(1));
-        assert_eq!(click_interval(10), Duration::from_millis(100));
-        assert_eq!(click_interval(100), Duration::from_millis(10));
-        assert_eq!(click_interval(500), Duration::from_millis(2));
-        assert!(click_interval(2) < Duration::from_secs(1));
     }
 
     #[test]
@@ -518,10 +480,10 @@ mod tests {
         let mut change_idx = 0;
         loop {
             if change_idx < cps_changes.len() && t >= cps_changes[change_idx].0 {
-                sched.set_cps(cps_changes[change_idx].1, true, t);
+                sched.set_cps(cps_changes[change_idx].1, t);
                 change_idx += 1;
             }
-            let wait = sched.wait_us(true, t);
+            let wait = sched.wait_us(t);
             if wait == 0 {
                 clicks += 1;
                 sched.advance(t);
@@ -562,9 +524,9 @@ mod tests {
         let mut sched = ClickScheduler::new(10); // 100 ms interval
         sched.start(0);
         sched.advance(0); // click at 0, next deadline 100_000
-        sched.set_cps(500, true, 20_000);
+        sched.set_cps(500, 20_000);
         assert_eq!(sched.next_deadline_us(), Some(22_000));
-        assert_eq!(sched.wait_us(true, 20_000), 2_000);
+        assert_eq!(sched.wait_us(20_000), 2_000);
     }
 
     #[test]
@@ -580,18 +542,18 @@ mod tests {
     fn missed_deadlines_do_not_burst() {
         let mut sched = ClickScheduler::new(100);
         sched.start(0);
-        assert_eq!(sched.wait_us(true, 0), 0);
+        assert_eq!(sched.wait_us(0), 0);
         sched.advance(0);
         // The machine goes away for 200 ms: the 10 ms deadline is long past.
         // Exactly one click fires at the return, and no catch-up burst.
-        assert_eq!(sched.wait_us(true, 200_000), 0, "the overdue click is due");
+        assert_eq!(sched.wait_us(200_000), 0, "the overdue click is due");
         sched.advance(200_000);
         assert_eq!(
             sched.next_deadline_us(),
             Some(200_000 + 10_000),
             "the deadline rolls to now+interval, not the old schedule"
         );
-        assert_ne!(sched.wait_us(true, 200_000 + 5_000), 0);
+        assert_ne!(sched.wait_us(200_000 + 5_000), 0);
     }
 
     #[test]
@@ -602,9 +564,9 @@ mod tests {
         assert_eq!(sched.next_deadline_us(), Some(100_000));
         // The user bumps to 100 CPS at t = 20 ms (mid-old-interval). The next
         // wait must be the new 10 ms, not the stale ~80 ms.
-        sched.set_cps(100, true, 20_000);
+        sched.set_cps(100, 20_000);
         assert_eq!(sched.next_deadline_us(), Some(30_000));
-        assert_eq!(sched.wait_us(true, 20_000), 10_000);
+        assert_eq!(sched.wait_us(20_000), 10_000);
         // Clicking resumes at 100 CPS from there: the next click at 30 ms is
         // within one new (10 ms) interval of the change at 20 ms.
         sched.advance(30_000);
@@ -618,9 +580,9 @@ mod tests {
         sched.advance(0); // next deadline 10_000
                           // Slow down to 1 CPS at t = 2 ms: the pending 8 ms click is kept (a
                           // slower rate must not be delayed further), then 1 s applies.
-        sched.set_cps(1, true, 2_000);
+        sched.set_cps(1, 2_000);
         assert_eq!(sched.next_deadline_us(), Some(10_000));
-        assert_eq!(sched.wait_us(true, 2_000), 8_000);
+        assert_eq!(sched.wait_us(2_000), 8_000);
         // After that click at t = 10_000, the interval is one second.
         sched.advance(10_000);
         assert_eq!(sched.next_deadline_us(), Some(10_000 + 1_000_000));
@@ -634,14 +596,14 @@ mod tests {
         assert_ne!(sched.next_deadline_us(), None);
         sched.stop();
         assert_eq!(sched.next_deadline_us(), None);
-        assert_eq!(sched.wait_us(false, 5_000), IDLE_WAIT_MICROS);
+        assert_eq!(sched.wait_us(5_000), IDLE_WAIT_MICROS);
         // A CPS change while stopped must not arm a deadline.
-        sched.set_cps(50, false, 5_000);
+        sched.set_cps(50, 5_000);
         assert_eq!(sched.next_deadline_us(), None);
         // Restart: click immediately, then the (1 s / 50 = 20 ms) interval.
         sched.start(5_000);
         assert!(sched.is_due(5_000));
-        assert_eq!(sched.wait_us(true, 5_000), 0);
+        assert_eq!(sched.wait_us(5_000), 0);
         sched.advance(5_000);
         assert_eq!(sched.next_deadline_us(), Some(5_000 + 20_000));
     }
@@ -653,7 +615,7 @@ mod tests {
         sched.start(0);
         let mut t = 0u64;
         for k in 1..=1000 {
-            assert_eq!(sched.wait_us(true, t), 0, "click {k} due at t={t}");
+            assert_eq!(sched.wait_us(t), 0, "click {k} due at t={t}");
             sched.advance(t);
             let expected = (k as u64) * 10_000;
             assert_eq!(
@@ -699,11 +661,10 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let source = WakeSource::new();
-        let event = source.command_event();
         let (tx, rx) = channel();
         let handle = WorkerHandle {
             tx,
-            command_event: event,
+            command_event: source.command_event(),
         };
         let events = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls = Arc::new(AtomicU32::new(0));

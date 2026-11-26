@@ -3,12 +3,12 @@
 //! never involved in Win32 hotkey handling.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, INFINITE};
+use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
 use windows::Win32::UI::WindowsAndMessaging::{
     MsgWaitForMultipleObjectsEx, PeekMessageW, MSG, MWMO_NONE, PM_REMOVE, QS_ALLINPUT, QS_HOTKEY,
@@ -16,69 +16,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::settings::HotkeyChoice;
-use crate::win_hotkey::{describe_registration_failure, next_hotkey_id, register_hotkey};
+use crate::win_event::Event;
+use crate::win_hotkey::{
+    describe_registration_failure, register_hotkey, HOTKEY_ID_MAX, HOTKEY_ID_MIN,
+};
 
 /// Events emitted toward the UI thread by the hotkey subsystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HotkeyEvent {
     /// The global hotkey was pressed; the caller should toggle clicking.
     Activated,
-    /// Registering the hotkey (initial or re-registered) failed. Clicking
-    /// must stay as it is and the message must be surfaced in the UI.
-    /// `active` is the binding the hotkey thread has registered at that
-    /// moment (`None` when nothing is registered): it is the authoritative
-    /// state for what to display as the active binding.
-    RegistrationFailed {
-        message: String,
-        active: Option<HotkeyChoice>,
-    },
-}
-
-/// A kernel event handle that is safe to move to another thread.
-///
-/// The event is a kernel object with no thread affinity: any thread may wait
-/// on or signal it. Ownership is single per instance: `CloseHandle` only runs
-/// in [`Hotkey::shutdown`] after `thread::join()`, so the handle is never
-/// used concurrently and never closed twice. After shutdown, any cloned copy
-/// (held in a [`HotkeyHandle`]) is never used again because the UI callbacks
-/// only fire while the window is alive.
-#[derive(Clone, Copy)]
-pub struct EventHandle(HANDLE);
-
-// SAFETY: see the struct-level documentation above.
-unsafe impl Send for EventHandle {}
-
-impl EventHandle {
-    /// Creates an auto-reset, initially-clear, anonymous event. Panics
-    /// when the event cannot be created (an allocation failure of a kernel
-    /// object is not recoverable here).
-    fn new() -> Self {
-        let event = unsafe {
-            // SAFETY: null attributes and null name create a plain
-            // non-inheritable anonymous event usable by any thread.
-            CreateEventW(None, false, false, PWSTR::null())
-        }
-        .unwrap_or_else(|error| panic!("failed to create a hotkey thread event: {error:?}"));
-        EventHandle(event)
-    }
-
-    /// Wakes a thread blocked in `MsgWaitForMultipleObjectsEx`.
-    fn signal(&self) {
-        let _ = unsafe {
-            // SAFETY: `SetEvent` only affects the kernel event this handle
-            // refers to.
-            SetEvent(self.0)
-        };
-    }
-
-    /// Closes the kernel object. Only [`Hotkey::shutdown`] calls this.
-    fn close(&self) {
-        let _ = unsafe {
-            // SAFETY: this is the sole close site, running after the thread
-            // that uses the handle has been joined.
-            CloseHandle(self.0)
-        };
-    }
+    /// The initial registration at startup failed, so no global hotkey is
+    /// active. Clicking stays as it is and the message must be surfaced in the
+    /// UI. (A failed *re*-registration is reported to the caller of
+    /// [`HotkeyHandle::set_binding`] instead.)
+    RegistrationFailed(String),
 }
 
 /// A failed (re-)registration report: the user-facing message plus the
@@ -110,12 +62,12 @@ enum HotkeyCommand {
 ///
 /// `set_binding` sends a re-registration command to the hotkey thread and
 /// blocks (bounded) until the thread reports the outcome, so the caller
-/// always knows whether the new binding is active. It must only be called
-/// while the window is alive; after [`Hotkey::shutdown`] the handle is stale.
+/// always knows whether the new binding is active. After
+/// [`Hotkey::shutdown`] it returns an error instead of blocking.
 #[derive(Clone)]
 pub struct HotkeyHandle {
     command_tx: Sender<HotkeyCommand>,
-    request_event: EventHandle,
+    request_event: Arc<Event>,
 }
 
 impl HotkeyHandle {
@@ -170,8 +122,8 @@ impl HotkeyHandle {
 /// authoritative for the running state.
 pub struct Hotkey {
     thread: JoinHandle<()>,
-    shutdown_event: EventHandle,
-    request_event: EventHandle,
+    shutdown_event: Arc<Event>,
+    request_event: Arc<Event>,
     command_tx: Sender<HotkeyCommand>,
 }
 
@@ -181,14 +133,16 @@ impl Hotkey {
     /// If the initial registration fails, `on_event` is called with
     /// [`HotkeyEvent::RegistrationFailed`] from the hotkey thread.
     pub fn spawn(initial: HotkeyChoice, on_event: impl Fn(HotkeyEvent) + Send + 'static) -> Hotkey {
-        let shutdown_event = EventHandle::new();
-        let request_event = EventHandle::new();
+        let shutdown_event = Arc::new(Event::new());
+        let request_event = Arc::new(Event::new());
         let (command_tx, command_rx) = channel();
 
         let thread = std::thread::Builder::new()
             .name("sinclicker-hotkey".to_owned())
-            .spawn(move || {
-                hotkey_loop(initial, shutdown_event, request_event, command_rx, on_event)
+            .spawn({
+                let shutdown = Arc::clone(&shutdown_event);
+                let request = Arc::clone(&request_event);
+                move || hotkey_loop(initial, &shutdown, &request, command_rx, on_event)
             })
             .expect("failed to spawn the hotkey thread");
 
@@ -203,21 +157,18 @@ impl Hotkey {
     pub fn handle(&self) -> HotkeyHandle {
         HotkeyHandle {
             command_tx: self.command_tx.clone(),
-            request_event: self.request_event,
+            request_event: Arc::clone(&self.request_event),
         }
     }
 
     /// Shuts the hotkey down: wakes the thread (which unregisters the active
-    /// hotkey on itself before exiting), joins it, and closes both events.
-    /// After this returns no global hotkey is registered and no hotkey
-    /// thread remains.
+    /// hotkey on itself before exiting) and joins it. After this returns no
+    /// global hotkey is registered and no hotkey thread remains.
     pub fn shutdown(self) {
         self.shutdown_event.signal();
         if let Err(error) = self.thread.join() {
             eprintln!("failed to join the hotkey thread: {error:?}");
         }
-        self.shutdown_event.close();
-        self.request_event.close();
     }
 }
 
@@ -233,19 +184,21 @@ struct CurrentBinding {
 /// the shutdown event, and unregisters the active hotkey on the way out.
 fn hotkey_loop(
     initial: HotkeyChoice,
-    shutdown: EventHandle,
-    request: EventHandle,
+    shutdown: &Event,
+    request: &Event,
     command_rx: Receiver<HotkeyCommand>,
     on_event: impl Fn(HotkeyEvent),
 ) {
-    // The binding currently registered (if any). Every (re-)
-    // registration gets a fresh id from the pool, so `is_toggle_hotkey`
+    // The binding currently registered (if any). Every (re-)registration
+    // gets the next id in the valid range (wrapping), so `is_toggle_hotkey`
     // accepts only the `WM_HOTKEY` message of the *current* binding: a
     // message queued by a superseded binding (pressed just before a
     // re-register) still carries the old id and is ignored instead of acting
     // as a stray toggle. Re-registration is register-new-then-retire-old, so
     // a failed re-registration leaves the previous binding active.
-    let id = next_hotkey_id();
+    let mut ids = (HOTKEY_ID_MIN..=HOTKEY_ID_MAX).cycle();
+    let mut next_id = move || ids.next().expect("a cycled non-empty range never ends");
+    let id = next_id();
     let mut current: Option<CurrentBinding> = match register_hotkey(initial, id) {
         Ok(()) => Some(CurrentBinding {
             choice: initial,
@@ -257,10 +210,7 @@ fn hotkey_loop(
                 code,
                 false, // nothing was registered before the initial attempt
             );
-            on_event(HotkeyEvent::RegistrationFailed {
-                message,
-                active: None,
-            });
+            on_event(HotkeyEvent::RegistrationFailed(message));
             None
         }
     };
@@ -272,10 +222,10 @@ fn hotkey_loop(
     loop {
         // Block until queued input, a binding-change request, or shutdown.
         let wait = unsafe {
-            // SAFETY: both events are live kernel objects for the whole loop
-            // (closed only in `Hotkey::shutdown`, after `join()`).
+            // SAFETY: both events are live for the whole loop (borrowed from
+            // `Arc`s that the spawning closure owns).
             MsgWaitForMultipleObjectsEx(
-                Some(&[shutdown.0, request.0]),
+                Some(&[shutdown.raw(), request.raw()]),
                 INFINITE,
                 wake_mask,
                 MWMO_NONE,
@@ -324,7 +274,7 @@ fn hotkey_loop(
                     if current.map(|current| current.choice) == Some(choice) {
                         let _ = response.send(Ok(()));
                     } else {
-                        let id = next_hotkey_id();
+                        let id = next_id();
                         match register_hotkey(choice, id) {
                             Ok(()) => {
                                 // The new binding is active now; retire the old
@@ -348,20 +298,14 @@ fn hotkey_loop(
                                 // still the active hotkey and the app keeps
                                 // working with the last good binding. Only the
                                 // new one is unavailable.
-                                let previous_active = current.is_some();
-                                let message = describe_registration_failure(
-                                    choice.display,
-                                    code,
-                                    previous_active,
-                                );
                                 let report = RegistrationReport {
-                                    message,
+                                    message: describe_registration_failure(
+                                        choice.display,
+                                        code,
+                                        current.is_some(),
+                                    ),
                                     active: current.map(|current| current.choice),
                                 };
-                                on_event(HotkeyEvent::RegistrationFailed {
-                                    message: report.message.clone(),
-                                    active: report.active,
-                                });
                                 let _ = response.send(Err(report));
                             }
                         }
@@ -395,40 +339,5 @@ mod tests {
         assert!(is_toggle_hotkey(WM_HOTKEY, 7usize, 7));
         assert!(!is_toggle_hotkey(WM_HOTKEY, 8usize, 7)); // stale id is ignored
         assert!(!is_toggle_hotkey(0, 7usize, 7));
-    }
-
-    #[test]
-    fn activation_report_is_cloneable_and_stable() {
-        let event = HotkeyEvent::Activated;
-        assert_eq!(event, HotkeyEvent::Activated);
-    }
-
-    #[test]
-    fn registration_failure_reports_the_active_binding_authoritatively() {
-        // The event carries the binding the hotkey thread still has
-        // registered, so the UI never has to guess from the desired or
-        // persisted choice.
-        let default = crate::settings::choice_for_display("Ctrl+Alt+F6").expect("default binding");
-        let failed = HotkeyEvent::RegistrationFailed {
-            message: "already in use".to_owned(),
-            active: Some(default),
-        };
-        match &failed {
-            HotkeyEvent::RegistrationFailed { active, .. } => {
-                assert_eq!(*active, Some(default));
-            }
-            other => panic!("expected RegistrationFailed, got {other:?}"),
-        }
-
-        // When nothing is registered (initial registration failed), `active`
-        // is `None` and the UI must not claim any binding.
-        let bare = HotkeyEvent::RegistrationFailed {
-            message: "no hotkey active".to_owned(),
-            active: None,
-        };
-        match bare {
-            HotkeyEvent::RegistrationFailed { active, .. } => assert_eq!(active, None),
-            other => panic!("expected RegistrationFailed, got {other:?}"),
-        }
     }
 }
