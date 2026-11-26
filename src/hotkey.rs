@@ -206,7 +206,7 @@ fn hotkey_loop(
         }),
         Err(code) => {
             let message = describe_registration_failure(
-                initial.display,
+                &initial.display(),
                 code,
                 false, // nothing was registered before the initial attempt
             );
@@ -300,7 +300,7 @@ fn hotkey_loop(
                                 // new one is unavailable.
                                 let report = RegistrationReport {
                                     message: describe_registration_failure(
-                                        choice.display,
+                                        &choice.display(),
                                         code,
                                         current.is_some(),
                                     ),

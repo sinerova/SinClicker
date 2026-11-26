@@ -1,8 +1,9 @@
-//! Settings: the supported hotkey catalog and persistence of the chosen
-//! binding and the CPS value in the per-user registry.
+//! Settings: the toggle hotkey binding (validation, display and parsing) and
+//! persistence of the chosen binding and the CPS value in the per-user
+//! registry.
 //!
-//! The catalog and startup resolution are pure and unit-tested; no test here
-//! registers a hotkey or sends input.
+//! Binding rules, formatting and startup resolution are pure and unit-tested;
+//! no test here registers a hotkey or sends input.
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -10,90 +11,160 @@ use windows::Win32::System::Registry::{
     RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_ROUTINE_FLAGS, REG_SZ,
     REG_VALUE_TYPE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_A, VK_BACK, VK_END, VK_F10,
-    VK_F11, VK_F13, VK_F14, VK_F15, VK_F16, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT,
-    VK_NEXT, VK_OEM_PERIOD, VK_PRIOR, VK_SPACE,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 use crate::clicker::{DEFAULT_CPS, MAX_CPS, MIN_CPS};
 
-/// A supported toggle hotkey.
+/// A validated toggle hotkey: optional modifiers plus one non-modifier key.
+///
+/// Only [`HotkeyChoice::new`] and [`HotkeyChoice::parse`] build one (or the
+/// [`DEFAULT_HOTKEY`] constant), so every value satisfies the binding rules
+/// documented on [`HotkeyChoice::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyChoice {
-    /// Canonical display string, for example `Ctrl+Alt+F6`. This is also the
-    /// persisted form.
-    pub display: &'static str,
-    /// Modifiers for `RegisterHotKey` (without `MOD_NOREPEAT`, which is added
-    /// at registration time).
+    /// Modifiers for `RegisterHotKey`: any of Ctrl, Shift and Alt (without
+    /// `MOD_NOREPEAT`, which is added at registration time).
     pub modifiers: HOT_KEY_MODIFIERS,
     pub vk: VIRTUAL_KEY,
 }
 
 const CTRL_ALT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0);
-const CTRL_SHIFT_ALT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(CTRL_ALT.0 | MOD_SHIFT.0);
+const NO_MODIFIERS: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0);
 
-const fn choice(
-    display: &'static str,
-    modifiers: HOT_KEY_MODIFIERS,
-    vk: VIRTUAL_KEY,
-) -> HotkeyChoice {
-    HotkeyChoice {
-        display,
-        modifiers,
-        vk,
+/// The default binding: Ctrl+Alt+F6.
+pub const DEFAULT_HOTKEY: HotkeyChoice = HotkeyChoice {
+    modifiers: CTRL_ALT,
+    vk: VK_F6,
+};
+
+/// Modifier names in canonical display order. The order matches what earlier
+/// versions persisted (for example `Ctrl+Shift+Alt+F6`), so saved bindings
+/// keep parsing.
+const MODIFIER_NAMES: [(HOT_KEY_MODIFIERS, &str); 3] = [
+    (MOD_CONTROL, "Ctrl"),
+    (MOD_SHIFT, "Shift"),
+    (MOD_ALT, "Alt"),
+];
+
+/// Every key a binding may use, with its display name. Punctuation keys are
+/// named after their US-layout legend, since Windows identifies them by
+/// virtual key rather than by the character they type.
+///
+/// Deliberately absent: the modifier and Windows keys, Escape (it cancels
+/// recording), Tab (focus navigation) and F12 (reserved for debuggers).
+#[rustfmt::skip]
+const KEY_NAMES: &[(VIRTUAL_KEY, &str)] = &[
+    (VK_A, "A"), (VK_B, "B"), (VK_C, "C"), (VK_D, "D"), (VK_E, "E"), (VK_F, "F"),
+    (VK_G, "G"), (VK_H, "H"), (VK_I, "I"), (VK_J, "J"), (VK_K, "K"), (VK_L, "L"),
+    (VK_M, "M"), (VK_N, "N"), (VK_O, "O"), (VK_P, "P"), (VK_Q, "Q"), (VK_R, "R"),
+    (VK_S, "S"), (VK_T, "T"), (VK_U, "U"), (VK_V, "V"), (VK_W, "W"), (VK_X, "X"),
+    (VK_Y, "Y"), (VK_Z, "Z"),
+    (VK_0, "0"), (VK_1, "1"), (VK_2, "2"), (VK_3, "3"), (VK_4, "4"),
+    (VK_5, "5"), (VK_6, "6"), (VK_7, "7"), (VK_8, "8"), (VK_9, "9"),
+    (VK_F1, "F1"), (VK_F2, "F2"), (VK_F3, "F3"), (VK_F4, "F4"), (VK_F5, "F5"),
+    (VK_F6, "F6"), (VK_F7, "F7"), (VK_F8, "F8"), (VK_F9, "F9"), (VK_F10, "F10"),
+    (VK_F11, "F11"), (VK_F13, "F13"), (VK_F14, "F14"), (VK_F15, "F15"),
+    (VK_F16, "F16"), (VK_F17, "F17"), (VK_F18, "F18"), (VK_F19, "F19"),
+    (VK_F20, "F20"), (VK_F21, "F21"), (VK_F22, "F22"), (VK_F23, "F23"),
+    (VK_F24, "F24"),
+    (VK_SPACE, "Space"), (VK_BACK, "Backspace"), (VK_RETURN, "Enter"),
+    (VK_INSERT, "Insert"), (VK_DELETE, "Delete"), (VK_HOME, "Home"), (VK_END, "End"),
+    (VK_PRIOR, "PageUp"), (VK_NEXT, "PageDown"),
+    (VK_UP, "Up"), (VK_DOWN, "Down"), (VK_LEFT, "Left"), (VK_RIGHT, "Right"),
+    (VK_SNAPSHOT, "PrintScreen"), (VK_SCROLL, "ScrollLock"), (VK_PAUSE, "Pause"),
+    (VK_APPS, "Menu"),
+    (VK_OEM_3, "Backquote"), (VK_OEM_MINUS, "Minus"), (VK_OEM_PLUS, "Equals"),
+    (VK_OEM_4, "LeftBracket"), (VK_OEM_6, "RightBracket"), (VK_OEM_5, "Backslash"),
+    (VK_OEM_1, "Semicolon"), (VK_OEM_7, "Quote"), (VK_OEM_COMMA, "Comma"),
+    (VK_OEM_PERIOD, "Period"), (VK_OEM_2, "Slash"),
+];
+
+fn key_name(vk: VIRTUAL_KEY) -> Option<&'static str> {
+    KEY_NAMES
+        .iter()
+        .find(|(k, _)| *k == vk)
+        .map(|(_, name)| *name)
+}
+
+fn is_function_key(vk: VIRTUAL_KEY) -> bool {
+    (VK_F1.0..=VK_F24.0).contains(&vk.0)
+}
+
+impl HotkeyChoice {
+    /// Validates a captured combination. `win` reports whether a Windows key
+    /// was held.
+    ///
+    /// Rules: no Windows-key combinations (Windows reserves them); the key
+    /// must be one of the supported keys (see `KEY_NAMES`); keys other than
+    /// F1–F24 need Ctrl or Alt, so the binding never swallows ordinary
+    /// typing; and Ctrl+Alt+Delete is refused (it is the secure attention
+    /// sequence, which Windows handles before any application). On failure a
+    /// short message suitable for the UI is returned.
+    pub fn new(
+        modifiers: HOT_KEY_MODIFIERS,
+        vk: VIRTUAL_KEY,
+        win: bool,
+    ) -> Result<HotkeyChoice, String> {
+        if win {
+            return Err("Windows-key shortcuts are reserved by Windows.".to_owned());
+        }
+        if vk == VK_F12 {
+            return Err("F12 is reserved by Windows.".to_owned());
+        }
+        let Some(name) = key_name(vk) else {
+            return Err("That key can't be used for the hotkey.".to_owned());
+        };
+        let modifiers = modifiers & (MOD_CONTROL | MOD_SHIFT | MOD_ALT);
+        if !is_function_key(vk) && (modifiers & CTRL_ALT) == NO_MODIFIERS {
+            return Err(format!("Add Ctrl or Alt to use {name}."));
+        }
+        if vk == VK_DELETE && (modifiers & CTRL_ALT) == CTRL_ALT {
+            return Err("Ctrl+Alt+Delete is reserved by Windows.".to_owned());
+        }
+        Ok(HotkeyChoice { modifiers, vk })
+    }
+
+    /// The display parts in order, for example `["Ctrl", "Alt", "F6"]`.
+    pub fn parts(self) -> Vec<&'static str> {
+        MODIFIER_NAMES
+            .iter()
+            .filter(|(m, _)| (self.modifiers & *m) != NO_MODIFIERS)
+            .map(|(_, name)| *name)
+            .chain(key_name(self.vk))
+            .collect()
+    }
+
+    /// The canonical display string, for example `Ctrl+Alt+F6`. This is also
+    /// the persisted form.
+    pub fn display(self) -> String {
+        self.parts().join("+")
+    }
+
+    /// Parses a canonical display string (as produced by
+    /// [`HotkeyChoice::display`]) back into a validated binding, or `None`
+    /// when it is not one.
+    pub fn parse(display: &str) -> Option<HotkeyChoice> {
+        let (modifier_names, key) = match display.rsplit_once('+') {
+            Some((modifier_names, key)) => (Some(modifier_names), key),
+            None => (None, display),
+        };
+        let vk = KEY_NAMES.iter().find(|(_, name)| *name == key)?.0;
+        let mut modifiers = NO_MODIFIERS;
+        for name in modifier_names.into_iter().flat_map(|m| m.split('+')) {
+            let (m, _) = MODIFIER_NAMES.iter().find(|(_, n)| *n == name)?;
+            modifiers |= *m;
+        }
+        let choice = HotkeyChoice::new(modifiers, vk, false).ok()?;
+        // Only the canonical spelling is accepted (no duplicates or reordering).
+        (choice.display() == display).then_some(choice)
     }
 }
 
-/// The bindings offered in the UI, in display order.
-///
-/// Every entry is Ctrl+Alt based: Ctrl is always present because Alt alone is
-/// reserved for menu/IME use, Shift may be added optionally, no Windows-key
-/// combination appears (those are reserved for the OS), F12 is excluded (it is
-/// reserved for debuggers), and Ctrl+Alt+Delete is excluded (it is the secure
-/// attention sequence, which Windows handles before any application hotkey).
-pub const SUPPORTED_HOTKEYS: [HotkeyChoice; 22] = [
-    choice("Ctrl+Alt+F6", CTRL_ALT, VK_F6),
-    choice("Ctrl+Alt+F7", CTRL_ALT, VK_F7),
-    choice("Ctrl+Alt+F8", CTRL_ALT, VK_F8),
-    choice("Ctrl+Alt+F9", CTRL_ALT, VK_F9),
-    choice("Ctrl+Alt+F10", CTRL_ALT, VK_F10),
-    choice("Ctrl+Alt+F11", CTRL_ALT, VK_F11),
-    choice("Ctrl+Alt+F13", CTRL_ALT, VK_F13),
-    choice("Ctrl+Alt+F14", CTRL_ALT, VK_F14),
-    choice("Ctrl+Alt+F15", CTRL_ALT, VK_F15),
-    choice("Ctrl+Alt+F16", CTRL_ALT, VK_F16),
-    choice("Ctrl+Alt+Insert", CTRL_ALT, VK_INSERT),
-    choice("Ctrl+Alt+Home", CTRL_ALT, VK_HOME),
-    choice("Ctrl+Alt+End", CTRL_ALT, VK_END),
-    choice("Ctrl+Alt+PageUp", CTRL_ALT, VK_PRIOR),
-    choice("Ctrl+Alt+PageDown", CTRL_ALT, VK_NEXT),
-    choice("Ctrl+Shift+Alt+F6", CTRL_SHIFT_ALT, VK_F6),
-    choice("Ctrl+Shift+Alt+F7", CTRL_SHIFT_ALT, VK_F7),
-    choice("Ctrl+Shift+Alt+F9", CTRL_SHIFT_ALT, VK_F9),
-    choice("Ctrl+Alt+Space", CTRL_ALT, VK_SPACE),
-    choice("Ctrl+Alt+Backspace", CTRL_ALT, VK_BACK),
-    choice("Ctrl+Alt+Period", CTRL_ALT, VK_OEM_PERIOD),
-    choice("Ctrl+Alt+A", CTRL_ALT, VK_A),
-];
-
-/// The default binding; also the first UI choice.
-pub const DEFAULT_HOTKEY: HotkeyChoice = SUPPORTED_HOTKEYS[0];
-
-/// Resolves a display string (from the UI or from persisted storage) to a
-/// supported choice, or `None` when it is not one.
-pub fn choice_for_display(display: &str) -> Option<HotkeyChoice> {
-    SUPPORTED_HOTKEYS
-        .iter()
-        .find(|h| h.display == display)
-        .copied()
-}
-
-/// The binding to start with: the persisted one when it is still supported,
+/// The binding to start with: the persisted one when it is still valid,
 /// otherwise the default.
 pub fn resolve_startup_hotkey(stored: Option<&str>) -> HotkeyChoice {
     stored
-        .and_then(choice_for_display)
+        .and_then(HotkeyChoice::parse)
         .unwrap_or(DEFAULT_HOTKEY)
 }
 
@@ -114,7 +185,7 @@ const HOTKEY_VALUE: PCWSTR = w!("Hotkey");
 const CPS_VALUE: PCWSTR = w!("Cps");
 
 /// Longest display string accepted from the registry, in UTF-16 units
-/// (including the terminator). Every catalog entry is far shorter; anything
+/// (including the terminator). Every valid binding is far shorter; anything
 /// longer is not a supported binding, so it is treated as unreadable.
 const MAX_STORED_DISPLAY_UNITS: usize = 64;
 
@@ -230,10 +301,10 @@ mod tests {
     fn resolve_startup_hotkey_falls_back_to_the_default() {
         assert_eq!(resolve_startup_hotkey(None), DEFAULT_HOTKEY);
         assert_eq!(
-            resolve_startup_hotkey(Some("Ctrl+Alt+F9")).display,
+            resolve_startup_hotkey(Some("Ctrl+Alt+F9")).display(),
             "Ctrl+Alt+F9"
         );
-        // Unsupported or retired bindings fall back.
+        // Invalid or reserved bindings fall back.
         assert_eq!(
             resolve_startup_hotkey(Some("Ctrl+Alt+Delete")),
             DEFAULT_HOTKEY
@@ -242,59 +313,86 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_expected_default_and_excludes_reserved_keys() {
-        assert_eq!(DEFAULT_HOTKEY.display, "Ctrl+Alt+F6");
-        for h in SUPPORTED_HOTKEYS {
-            assert!(!h.display.contains("F12"), "F12 is reserved: {}", h.display);
-            assert!(
-                !h.display.contains("Win"),
-                "Win is OS-reserved: {}",
-                h.display
-            );
-            assert!(
-                !h.display.contains("Delete"),
-                "Ctrl+Alt+Delete is the SAS: {}",
-                h.display
-            );
-            assert!(
-                h.modifiers.0 & CTRL_ALT.0 == CTRL_ALT.0,
-                "every binding needs Ctrl+Alt: {}",
-                h.display
-            );
+    fn default_is_ctrl_alt_f6() {
+        assert_eq!(DEFAULT_HOTKEY.display(), "Ctrl+Alt+F6");
+        assert_eq!(DEFAULT_HOTKEY.parts(), ["Ctrl", "Alt", "F6"]);
+        assert_eq!(
+            HotkeyChoice::new(CTRL_ALT, VK_F6, false),
+            Ok(DEFAULT_HOTKEY)
+        );
+    }
+
+    #[test]
+    fn bindings_saved_by_earlier_versions_still_parse() {
+        for display in [
+            "Ctrl+Alt+F6",
+            "Ctrl+Alt+F16",
+            "Ctrl+Alt+Insert",
+            "Ctrl+Alt+PageUp",
+            "Ctrl+Alt+PageDown",
+            "Ctrl+Shift+Alt+F9",
+            "Ctrl+Alt+Space",
+            "Ctrl+Alt+Backspace",
+            "Ctrl+Alt+Period",
+            "Ctrl+Alt+A",
+        ] {
+            let choice = HotkeyChoice::parse(display).expect(display);
+            assert_eq!(choice.display(), display);
         }
     }
 
     #[test]
-    fn catalog_entries_are_unique() {
-        for (i, a) in SUPPORTED_HOTKEYS.iter().enumerate() {
-            for b in &SUPPORTED_HOTKEYS[i + 1..] {
-                assert_ne!(a.display, b.display);
-                assert_ne!(
-                    (a.modifiers, a.vk),
-                    (b.modifiers, b.vk),
-                    "{} vs {}",
-                    a.display,
-                    b.display
-                );
+    fn every_key_round_trips() {
+        for (vk, name) in KEY_NAMES {
+            let choice = HotkeyChoice::new(MOD_CONTROL | MOD_SHIFT, *vk, false).expect(name);
+            assert_eq!(HotkeyChoice::parse(&choice.display()), Some(choice));
+        }
+    }
+
+    #[test]
+    fn key_names_are_unique() {
+        for (i, (vk_a, a)) in KEY_NAMES.iter().enumerate() {
+            for (vk_b, b) in &KEY_NAMES[i + 1..] {
+                assert_ne!(vk_a, vk_b, "{a} vs {b}");
+                assert_ne!(a, b);
             }
         }
     }
 
     #[test]
-    fn choice_for_display_round_trips_catalog() {
-        for h in SUPPORTED_HOTKEYS {
-            assert_eq!(choice_for_display(h.display), Some(h), "for {}", h.display);
-        }
+    fn new_enforces_the_binding_rules() {
+        assert!(HotkeyChoice::new(CTRL_ALT, VK_F6, true).is_err()); // Win key
+        assert!(HotkeyChoice::new(CTRL_ALT, VK_F12, false).is_err());
+        assert!(HotkeyChoice::new(CTRL_ALT, VK_DELETE, false).is_err());
+        assert!(HotkeyChoice::new(CTRL_ALT, VK_ESCAPE, false).is_err());
+        assert!(HotkeyChoice::new(CTRL_ALT, VK_SHIFT, false).is_err());
+        assert!(HotkeyChoice::new(MOD_SHIFT, VK_A, false).is_err());
+        assert!(HotkeyChoice::new(NO_MODIFIERS, VK_A, false).is_err());
+        // Function keys may stand alone; other keys need Ctrl or Alt.
+        assert!(HotkeyChoice::new(NO_MODIFIERS, VK_F8, false).is_ok());
+        assert!(HotkeyChoice::new(MOD_SHIFT, VK_F8, false).is_ok());
+        assert!(HotkeyChoice::new(MOD_CONTROL, VK_A, false).is_ok());
+        assert!(HotkeyChoice::new(MOD_ALT, VK_DELETE, false).is_ok());
+        // Stray flags such as MOD_NOREPEAT are dropped.
+        assert_eq!(
+            HotkeyChoice::new(CTRL_ALT | MOD_NOREPEAT, VK_F6, false),
+            Ok(DEFAULT_HOTKEY)
+        );
     }
 
     #[test]
-    fn choice_for_display_rejects_unsupported() {
-        assert_eq!(choice_for_display("Ctrl+Alt+F12"), None);
-        assert_eq!(choice_for_display("Ctrl+Alt+G"), None);
-        assert_eq!(choice_for_display("Alt+F6"), None);
-        assert_eq!(choice_for_display("Ctrl+F6"), None);
-        assert_eq!(choice_for_display("Ctrl+Alt+Win+F6"), None);
-        assert_eq!(choice_for_display(""), None);
-        assert_eq!(choice_for_display("Ctrl+Alt+F6 "), None); // trailing space
+    fn parse_rejects_non_canonical_or_invalid_strings() {
+        assert_eq!(
+            HotkeyChoice::parse("F6"),
+            HotkeyChoice::new(NO_MODIFIERS, VK_F6, false).ok()
+        );
+        assert_eq!(HotkeyChoice::parse("Ctrl+Alt+F12"), None);
+        assert_eq!(HotkeyChoice::parse("A"), None);
+        assert_eq!(HotkeyChoice::parse("Alt+Ctrl+F6"), None); // order
+        assert_eq!(HotkeyChoice::parse("Ctrl+Ctrl+F6"), None); // duplicate
+        assert_eq!(HotkeyChoice::parse("Ctrl+Alt+Win+F6"), None);
+        assert_eq!(HotkeyChoice::parse(""), None);
+        assert_eq!(HotkeyChoice::parse("+F6"), None);
+        assert_eq!(HotkeyChoice::parse("Ctrl+Alt+F6 "), None); // trailing space
     }
 }
